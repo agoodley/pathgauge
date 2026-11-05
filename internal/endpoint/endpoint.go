@@ -194,9 +194,13 @@ type session struct {
 	tests      map[string]*tcpTest
 	sinks      map[uint32]*sinkEntry
 	sends      map[uint32]*sendEntry
-	probeTTL   map[int]uint64
-	probeTOS   map[int]uint64
-	pmtuSeen   int
+	// peers holds per-stream return addresses: a client that sends a
+	// stream from its own UDP socket (one simulated application session)
+	// punches with that stream's ID, and the stream is sent back to it.
+	peers    map[uint32]*net.UDPAddr
+	probeTTL map[int]uint64
+	probeTOS map[int]uint64
+	pmtuSeen int
 
 	usedShaping bool
 }
@@ -287,6 +291,7 @@ func (s *Server) handshake(c *net.TCPConn) (*session, error) {
 		tests:    map[string]*tcpTest{},
 		sinks:    map[uint32]*sinkEntry{},
 		sends:    map[uint32]*sendEntry{},
+		peers:    map[uint32]*net.UDPAddr{},
 		probeTTL: map[int]uint64{},
 		probeTOS: map[int]uint64{},
 	}

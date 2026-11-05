@@ -50,6 +50,10 @@ type Options struct {
 	Progress    func(Event)
 	// Shaper enables the SQM tuner (local shaping) when non-nil.
 	SQM SQMHooks
+	// Mix is the traffic mix: a scenario name or "kind:count,..." (default
+	// "office"). NoDSCP sends the simulated calls unmarked.
+	Mix    string
+	NoDSCP bool
 }
 
 // SQMHooks lets the runner drive local shaping without importing it.
@@ -62,13 +66,13 @@ var Profiles = map[string][]string{
 	"quick":    {"info", "latency", "tcp-down", "tcp-up", "bufferbloat"},
 	"standard": {"info", "latency", "trace", "tcp-down-1", "tcp-up-1", "tcp-down", "tcp-up", "udp-down", "udp-up", "bufferbloat", "pmtu", "integrity", "voip"},
 	"full": {"info", "latency", "trace", "tcp-down-1", "tcp-up-1", "tcp-down", "tcp-up", "streams-down", "streams-up", "udp-down", "udp-up",
-		"bufferbloat", "sweep-down", "sweep-up", "sizesweep-up", "pmtu", "integrity", "voip", "voip-loaded", "qos", "cc", "shortflow", "discrimination", "mtr"},
+		"bufferbloat", "sweep-down", "sweep-up", "sizesweep-up", "pmtu", "integrity", "voip", "voip-loaded", "qos", "mix", "cc", "shortflow", "discrimination", "mtr"},
 }
 
 // AllTests lists every runnable test ID.
 var AllTests = []string{"info", "latency", "trace", "mtr", "tcp-down", "tcp-up", "tcp-down-1", "tcp-up-1", "streams-down", "streams-up",
 	"udp-down", "udp-up", "bufferbloat", "sweep-down", "sweep-up", "sizesweep-up", "sizesweep-down", "pmtu", "integrity", "voip", "voip-loaded",
-	"qos", "cc", "shortflow", "discrimination", "sqm"}
+	"qos", "mix", "capacity-voice", "capacity-video", "cc", "shortflow", "discrimination", "sqm"}
 
 // Titles are human names for test IDs.
 var Titles = map[string]string{
@@ -81,6 +85,8 @@ var Titles = map[string]string{
 	"integrity": "Middlebox checks (DSCP, ECN, MSS, NAT)", "voip": "Voice call simulation", "voip-loaded": "Voice call under load",
 	"cc": "Congestion-control comparison", "shortflow": "Short transfers and connection setup", "discrimination": "Throttling and WAN optimiser checks",
 	"sqm": "SQM tuner (shaping sweep)", "qos": "QoS priority under load (EF vs best effort)",
+	"mix": "Traffic mix (simulated calls, browsing, streaming and transfers)", "capacity-voice": "Call capacity: voice",
+	"capacity-video": "Call capacity: video",
 }
 
 // NewRunID returns a random run ID.
@@ -231,6 +237,8 @@ func testKind(t string) string {
 		return "sizesweep"
 	case strings.HasPrefix(t, "voip"):
 		return "voip"
+	case strings.HasPrefix(t, "capacity-"):
+		return "capacity"
 	case t == "mtr":
 		return "trace"
 	}
@@ -371,6 +379,15 @@ func runOne(ctx context.Context, c *Client, t string, o Options, st *state, rep 
 	case "qos":
 		d, _ := tcpDuration(o, st, 10*time.Second)
 		return RunQoS(ctx, c, scaled(o, 5*time.Second), d, 4)
+	case "mix":
+		return RunMix(ctx, c, MixParams{Spec: o.Mix, Phase: max(scaled(o, 30*time.Second), 10*time.Second),
+			RateCap: realtimeCap(o, st), DSCP: !o.NoDSCP, OnRTT: mixLive(progress)})
+	case "capacity-voice", "capacity-video":
+		return RunCapacity(ctx, c, CapacityParams{Kind: strings.TrimPrefix(t, "capacity-"), Step: max(scaled(o, 8*time.Second), 4*time.Second),
+			RateCap: realtimeCap(o, st), DSCP: !o.NoDSCP, WithTransfers: true, OnRTT: mixLive(progress),
+			OnStep: func(search string, s results.CapacityStep) {
+				progress(map[string]any{"kind": "capacity", "search": search, "step": s})
+			}})
 	case "sqm":
 		if o.SQM == nil {
 			return nil, fmt.Errorf("the SQM tuner needs local shaping permission (run with --allow-shaping as root or via the agent service)")
@@ -379,6 +396,31 @@ func runOne(ctx context.Context, c *Client, t string, o Options, st *state, rep 
 		return o.SQM.Run(ctx, c, down, up, func(e Event) { progress(e.Data) })
 	}
 	return nil, fmt.Errorf("test %q not implemented", t)
+}
+
+// realtimeCap is the rate (bit/s, each direction) simulated calls may use;
+// 0 means no cap.
+func realtimeCap(o Options, st *state) float64 {
+	c := math.Min(rateCap(o, st, results.Down), rateCap(o, st, results.Up))
+	if math.IsInf(c, 1) {
+		return 0
+	}
+	return c
+}
+
+// mixLive turns latency-probe samples into live progress events.
+func mixLive(progress func(any)) func(phase string, t, rtt float64) {
+	var mu sync.Mutex
+	last := time.Time{}
+	return func(phase string, t, rtt float64) {
+		mu.Lock()
+		defer mu.Unlock()
+		if time.Since(last) < 200*time.Millisecond {
+			return
+		}
+		last = time.Now()
+		progress(map[string]any{"kind": "latency", "phase": phase, "t": math.Round(t*100) / 100, "rtt_ms": math.Round(rtt*100) / 100})
+	}
 }
 
 func firstNonEmpty(a, b string) string {

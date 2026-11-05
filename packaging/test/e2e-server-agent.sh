@@ -52,7 +52,7 @@ echo "-- services active; agent enrolled"
 
 SERVER_IP=$(docker inspect -f "{{(index .NetworkSettings.Networks \"$NET\").IPAddress}}" pg-e2e-server)
 python3 -I - "$SERVER_IP" "$PASS" <<'PY' || fail "API checks"
-import http.cookiejar, json, ssl, sys, time, urllib.request
+import http.cookiejar, json, ssl, sys, time, urllib.error, urllib.request
 ip, pw = sys.argv[1], sys.argv[2]
 ctx = ssl.create_default_context(); ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
 jar = http.cookiejar.CookieJar()
@@ -72,8 +72,14 @@ else:
     sys.exit("agent never came online")
 a = agents[0]
 print(f"   agent {a['name']} online, version {a['version']}")
-tests = ["info", "latency", "trace", "tcp-down", "tcp-up", "tcp-down-1", "udp-down", "bufferbloat", "pmtu", "integrity", "sweep-down", "sqm"]
-rid = api("POST", "/api/runs", {"agent_id": a["id"], "profile": "standard", "tests": tests, "scale": 0.3, "max_rate_mbps": 3000})["run_id"]
+tests = ["info", "latency", "trace", "tcp-down", "tcp-up", "tcp-down-1", "udp-down", "bufferbloat", "pmtu", "integrity", "sweep-down", "mix", "sqm"]
+try:
+    api("POST", "/api/runs", {"agent_id": a["id"], "tests": ["mix"], "mix": "voice:1,telepathy:2"})
+    sys.exit("an invalid mix was accepted")
+except urllib.error.HTTPError as e:
+    assert e.code == 400, e.code
+rid = api("POST", "/api/runs", {"agent_id": a["id"], "profile": "standard", "tests": tests, "scale": 0.3, "max_rate_mbps": 3000,
+                                "mix": "voice:3,video:1,web:1,download:1,upload:1"})["run_id"]
 t0 = time.time()
 while True:
     run = api("GET", f"/api/runs/{rid}")
@@ -93,6 +99,10 @@ steps = {s["id"].split("-", 1)[1]: s["result"] for s in rep["steps"]}
 trace = steps.get("trace-fwd")
 assert trace and trace["method"] == "udp-paris", f"service should have CAP_NET_RAW for Paris traceroute: {trace and trace['method']}"
 assert steps["sqm"]["steps"], "SQM tuner did not run (shaping via the agent service)"
+mix = steps["mix"]
+assert [p["name"] for p in mix["phases"]] == ["interactive", "with-transfers"], mix["phases"]
+assert all(not s.get("error") for p in mix["phases"] for s in p["sessions"]), "mix session errors"
+print(f"   mix: {mix['spec']} -> {mix['verdict']}; " + "; ".join(f"{k['kind']} {k['value']}{k['unit']}" for k in mix["phases"][1]["kinds"]))
 assert all(not s.get("error") for s in steps["sqm"]["steps"]), steps["sqm"]["steps"]
 print(f"   steps ok: {len(rep['steps'])}; trace method {trace['method']}; sqm qdisc {steps['sqm']['steps'][0]['qdisc']}; findings {[f['id'] for f in rep['findings']][:6]}")
 page = op.open(urllib.request.Request(f"https://{ip}:7443/agents"), timeout=30).read().decode()

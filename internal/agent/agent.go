@@ -403,7 +403,7 @@ func (a *Agent) buildOptions(req agentproto.RunRequest) (engine.Options, []strin
 		return engine.Options{}, nil, errors.New("this agent's local policy does not allow tests at this time")
 	}
 	o := engine.Options{Profile: req.Profile, Tests: req.Tests, Skip: req.Skip, Scale: req.Scale, MaxRateMbps: req.MaxRateMbps,
-		Streams: req.Streams, TraceCycles: req.TraceCycles, Resolve: true,
+		Streams: req.Streams, TraceCycles: req.TraceCycles, Resolve: true, Mix: req.Mix, NoDSCP: req.NoDSCP,
 		Labels: results.LinkLabels{Client: req.ClientName, Endpoint: req.ServerName}}
 	tests, err := o.TestList()
 	if err != nil {

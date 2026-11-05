@@ -148,6 +148,10 @@ export interface LineSeries {
   /** Categorical slot 0–3 (fixed order). */
   slot?: number;
   points?: boolean;
+  /** Line with an 8 px marker (2 px surface ring) at every point. */
+  markers?: boolean;
+  /** Marker size when markers is set (default 9, ring included). */
+  markerSize?: number;
   step?: boolean;
   dashed?: boolean;
   /** Override colour (only for a neutral "other" series). */
@@ -166,6 +170,10 @@ export interface LineOpts {
   yName: string;
   xType?: 'value' | 'time';
   yZero?: boolean;
+  /** Fixed y minimum (e.g. 1 for MOS); overrides yZero. */
+  yMin?: number;
+  /** Base-2 log x-axis (for counts that double, such as session searches). */
+  xLog?: boolean;
   xMin?: number;
   xMax?: number;
   yFmt?: (v: number) => string;
@@ -205,20 +213,23 @@ export function lineOption(P: Palette, o: LineOpts): Option {
           .map((p) => {
             const v = p.value as [number, number | null] | undefined;
             if (!v || v[1] === null || v[1] === undefined) return '';
-            return `<div>${p.marker ?? ''}${esc(p.seriesName ?? '')}: <b>${esc(yFmt(Number(v[1])))}</b></div>`;
+            // Series sampled at different x: name the point's own x.
+            const at = v0 && Number(v[0]) !== Number(v0[0]) ? ` <span style="opacity:.75">(${esc(xFmt(Number(v[0])))})</span>` : '';
+            return `<div>${p.marker ?? ''}${esc(p.seriesName ?? '')}: <b>${esc(yFmt(Number(v[1])))}</b>${at}</div>`;
           })
           .join('');
         return `<div style="font-weight:600;margin-bottom:2px">${esc(head)}</div>${rows}`;
       },
     },
     xAxis: {
-      type: o.xType ?? 'value',
+      type: o.xLog ? 'log' : (o.xType ?? 'value'),
+      logBase: o.xLog ? 2 : undefined,
       name: o.xName,
       nameLocation: 'middle',
       nameGap: 26,
       min: o.xMin ?? 'dataMin',
       max: o.xMax ?? 'dataMax',
-      minInterval: o.xInteger ? 1 : undefined,
+      minInterval: o.xInteger && !o.xLog ? 1 : undefined,
       ...ax,
       splitLine: { show: false },
       axisLabel: {
@@ -234,7 +245,7 @@ export function lineOption(P: Palette, o: LineOpts): Option {
       name: o.yName,
       nameLocation: 'end',
       nameGap: 10,
-      min: o.yZero === false ? undefined : 0,
+      min: o.yMin ?? (o.yZero === false ? undefined : 0),
       max: o.yMax,
       ...ax,
       nameTextStyle: { ...ax.nameTextStyle, align: 'left' },
@@ -249,13 +260,13 @@ export function lineOption(P: Palette, o: LineOpts): Option {
         data: s.data,
         step: s.step ? 'middle' : undefined,
         // A line needs two points; show markers while a series is that short.
-        showSymbol: !!s.points || s.data.length < 3,
+        showSymbol: !!s.points || !!s.markers || s.data.length < 3,
         symbol: 'circle',
-        symbolSize: s.points ? 5 : 4,
+        symbolSize: s.markers ? (s.markerSize ?? 9) : s.points ? 5 : 4,
         connectNulls: false,
         color: c,
         lineStyle: { width: s.points ? 0 : 2, color: c, type: s.dashed ? 'dashed' : 'solid' },
-        itemStyle: { color: c },
+        itemStyle: s.markers ? { color: c, borderColor: P.surface, borderWidth: 2 } : { color: c },
         emphasis: { disabled: true },
         z: s.dashed ? 2 : 3,
         markArea:
@@ -279,6 +290,8 @@ export interface BarOpts {
   yName: string;
   yFmt?: (v: number) => string;
   horizontal?: boolean;
+  /** Fixed maximum of the value axis (e.g. 100 for percentages). */
+  yMax?: number;
 }
 
 export function barOption(P: Palette, o: BarOpts): Option {
@@ -300,6 +313,7 @@ export function barOption(P: Palette, o: BarOpts): Option {
     nameLocation: o.horizontal ? 'middle' : 'end',
     nameGap: o.horizontal ? 26 : 10,
     min: 0,
+    max: o.yMax,
     ...ax,
     nameTextStyle: { ...ax.nameTextStyle, align: o.horizontal ? 'center' : 'left' },
     axisLine: { show: false },

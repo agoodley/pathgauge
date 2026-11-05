@@ -287,6 +287,10 @@ func section(r *results.Report, s results.Step) template.HTML {
 		fmt.Fprintf(&b, `<p>%s.</p>`, html.EscapeString(v.Verdict))
 	case *results.SQMTuner:
 		sqmSection(&b, v)
+	case *results.Mix:
+		mixSection(&b, v)
+	case *results.Capacity:
+		capacitySection(&b, v)
 	case *results.QoS:
 		var rows [][]string
 		var cats []string

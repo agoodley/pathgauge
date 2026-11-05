@@ -58,6 +58,8 @@ type RunRequest struct {
 	MaxRateMbps float64  `json:"max_rate_mbps,omitempty"`
 	Streams     int      `json:"streams,omitempty"`
 	TraceCycles int      `json:"trace_cycles,omitempty"`
+	Mix         string   `json:"mix,omitempty"`     // traffic mix for the mix test
+	NoDSCP      bool     `json:"no_dscp,omitempty"` // send simulated calls unmarked
 	ClientName  string   `json:"client_name"`
 	ServerName  string   `json:"server_name"`
 }

@@ -7,11 +7,12 @@ import { useTick } from '../lib/hooks';
 import { live, useRunEvents } from '../lib/live';
 import { Link } from '../lib/router';
 import { usePalette } from '../lib/theme';
-import type { EngineEvent, Run, SweepStep } from '../lib/types';
+import type { CapacityStep, EngineEvent, Run, SweepStep } from '../lib/types';
 import { Badge, Card, ConfirmButton, Empty, Notice, PageHeader, toast } from '../components/ui';
 import { Figure, lineOption, type LineSeries } from '../components/Chart';
 import { profileLabel, useProfiles } from '../components/shared';
 import { SweepTable, bloatSeries, stepHeadline } from '../components/StepResult';
+import { CapacityStepsTable, capacityMetric, capacityOption, capacityOverlap, OVERLAP_NOTE, SEARCH_LABEL } from '../components/MixResult';
 
 interface StepState {
   index: number;
@@ -36,7 +37,16 @@ interface LiveState {
   sqm: string[];
   throughputStep: string;
   latencyStep: string;
+  /** Traffic mix / call capacity: probe RTT by series, phases end to end. */
+  sessionRtt: Map<string, [number, number | null][]>;
+  /** The phase the latest probe sample came from ("with-transfers", "8 sessions", …). */
+  sessionPhase: string;
+  sessionTest: string;
+  /** Call capacity steps in the order they finished. */
+  capacity: (CapacityStep & { search: string })[];
 }
+
+const isSessionTest = (t: string) => t === 'mix' || t.startsWith('capacity-');
 
 function derive(events: EngineEvent[]): LiveState {
   const st: LiveState = {
@@ -50,11 +60,18 @@ function derive(events: EngineEvent[]): LiveState {
     sqm: [],
     throughputStep: '',
     latencyStep: '',
+    sessionRtt: new Map(),
+    sessionPhase: '',
+    sessionTest: '',
+    capacity: [],
   };
   // Per-direction time offsets so tests that restart their clock (stream
   // scaling, bufferbloat phases) draw left to right.
   const lastT = new Map<string, number>();
   const offset = new Map<string, number>();
+  // Mix and capacity phases each restart their clock at 0: lay them end to end.
+  const phaseOffset = new Map<string, number>();
+  let phaseEnd = 0;
   for (const e of events) {
     switch (e.type) {
       case 'run_start':
@@ -70,8 +87,14 @@ function derive(events: EngineEvent[]): LiveState {
         st.latency = new Map();
         st.sweep = [];
         st.sqm = [];
+        st.sessionRtt = new Map();
+        st.sessionPhase = '';
+        st.sessionTest = '';
+        st.capacity = [];
         lastT.clear();
         offset.clear();
+        phaseOffset.clear();
+        phaseEnd = 0;
         break;
       }
       case 'step_done': {
@@ -108,6 +131,31 @@ function derive(events: EngineEvent[]): LiveState {
           arr.push([Math.round(t * 100) / 100, Number(d.mbps)]);
           st.throughput.set(dir, arr);
           st.throughputStep = st.current?.title ?? '';
+        } else if (kind === 'latency' && isSessionTest(e.test ?? st.current?.test ?? '')) {
+          const test = e.test ?? st.current?.test ?? '';
+          const ph = String(d.phase ?? '');
+          const rtt = Number(d.rtt_ms);
+          if (!Number.isFinite(rtt)) break;
+          // Mix: one series per phase. Capacity: one per search, so the
+          // steps ("8 sessions", "8 sessions with transfers") join up.
+          const key = test === 'mix' ? ph : / with transfers$/.test(ph) ? 'with-transfers' : 'alone';
+          const arr = st.sessionRtt.get(key) ?? [];
+          if (!phaseOffset.has(ph)) {
+            const start = phaseEnd > 0 ? phaseEnd + 0.5 : 0;
+            phaseOffset.set(ph, start);
+            // Break the line across the pause between two steps.
+            if (arr.length) arr.push([start - 0.25, null]);
+          }
+          const t = Math.round((Number(d.t) + (phaseOffset.get(ph) ?? 0)) * 100) / 100;
+          phaseEnd = Math.max(phaseEnd, t);
+          arr.push([t, rtt]);
+          st.sessionRtt.set(key, arr);
+          st.sessionPhase = ph;
+          st.sessionTest = test;
+          st.latencyStep = st.current?.title ?? '';
+        } else if (kind === 'capacity' && d.step && typeof d.step === 'object') {
+          st.capacity.push({ ...(d.step as CapacityStep), search: String(d.search ?? 'alone') });
+          st.sessionTest = e.test ?? st.current?.test ?? st.sessionTest;
         } else if (kind === 'latency') {
           const ph = String(d.phase ?? 'idle');
           const arr = st.latency.get(ph) ?? [];
@@ -127,6 +175,13 @@ function derive(events: EngineEvent[]): LiveState {
 }
 
 const DIR_LABEL: Record<string, string> = { down: 'download', up: 'upload', bidir: 'both' };
+// Same names as the result page (MixPhase.label, capacity searches).
+const SESSION_SERIES: Record<string, [label: string, slot: number]> = {
+  interactive: ['without transfers', 0],
+  'with-transfers': ['with file transfers', 1],
+  all: ['all sessions', 0],
+  alone: ['on their own', 0],
+};
 const DIR_SLOT: Record<string, number> = { down: 0, up: 1, bidir: 2 };
 
 export function LiveRun({ run, onChange }: { run: Run; onChange: () => void }) {
@@ -191,6 +246,31 @@ export function LiveRun({ run, onChange }: { run: Run; onChange: () => void }) {
       }),
     [st, P],
   );
+
+  const capKind = st.sessionTest.replace(/^capacity-/, '');
+  const sessOpt = useMemo(() => {
+    const cap = st.sessionTest.startsWith('capacity-');
+    const series: LineSeries[] = [...st.sessionRtt.entries()]
+      .map(([key, data]) => {
+        const [name, slot] =
+          cap && key === 'with-transfers' ? [SEARCH_LABEL['with-transfers'].toLowerCase(), 1] : (SESSION_SERIES[key] ?? [key, 2]);
+        return { name, slot, data };
+      })
+      .sort((a, b) => a.slot - b.slot);
+    return lineOption(P, {
+      series,
+      xName: 'seconds',
+      yName: 'RTT (ms)',
+      yFmt: (y) => fmtMs(y),
+      xFmt: (x) => `${f1(x)} s`,
+    });
+  }, [st, P]);
+
+  const capSearches = useMemo(
+    () => ['alone', 'with-transfers'].map((search) => ({ search, steps: st.capacity.filter((c) => c.search === search) })),
+    [st],
+  );
+  const capOpt = useMemo(() => capacityOption(P, capKind, capSearches), [P, capKind, capSearches]);
 
   const sweepOpt = useMemo(() => {
     const max = Math.max(0, ...st.sweep.map((s) => Math.max(s.offered_mbps, s.delivered_mbps)));
@@ -276,7 +356,7 @@ export function LiveRun({ run, onChange }: { run: Run; onChange: () => void }) {
           </ol>
         </Card>
         <div className="live-charts">
-          {(st.throughput.size > 0 || (st.sweep.length === 0 && st.sqm.length === 0)) && (
+          {(st.throughput.size > 0 || (st.sweep.length === 0 && st.sqm.length === 0 && st.sessionRtt.size === 0 && st.capacity.length === 0)) && (
             <Card title={`Live throughput${st.throughputStep ? ` · ${st.throughputStep}` : ''}`}>
               {st.throughput.size ? (
                 <Figure title="Throughput at the receiver" option={thrOpt} height={240} />
@@ -288,6 +368,36 @@ export function LiveRun({ run, onChange }: { run: Run; onChange: () => void }) {
           {st.latency.size > 0 && (
             <Card title={`Live latency under load · ${st.latencyStep}`}>
               <Figure title="Probe round-trip time by phase" option={latOpt} height={240} />
+            </Card>
+          )}
+          {st.sessionRtt.size > 0 && (
+            <Card title={`Live latency · ${st.latencyStep}`}>
+              <Figure
+                title={`Probe round-trip time while the sessions run${st.sessionPhase ? ` · now: ${phaseText(st.sessionPhase)}` : ''}`}
+                option={sessOpt}
+                height={240}
+                note={st.sessionTest === 'mix' ? undefined : 'Each step adds sessions; gaps are the pauses between steps.'}
+              />
+            </Card>
+          )}
+          {st.capacity.length > 0 && (
+            <Card title={`Capacity search · ${st.current?.title ?? st.latencyStep}`}>
+              {st.capacity.length >= 2 && (
+                <Figure
+                  title={`${capacityMetric(capKind).title} (so far)`}
+                  option={capOpt}
+                  height={220}
+                  note={capacityOverlap(capSearches) ? OVERLAP_NOTE : undefined}
+                />
+              )}
+              {capSearches
+                .filter((x) => x.steps.length)
+                .map((x) => (
+                  <div key={x.search}>
+                    <h4>{SEARCH_LABEL[x.search] ?? x.search}</h4>
+                    <CapacityStepsTable kind={capKind} steps={x.steps} />
+                  </div>
+                ))}
             </Card>
           )}
           {st.sweep.length > 0 && (
@@ -312,6 +422,13 @@ export function LiveRun({ run, onChange }: { run: Run; onChange: () => void }) {
       </p>
     </div>
   );
+}
+
+/** A mix phase name or a capacity step label ("8 sessions with transfers") for display. */
+function phaseText(ph: string): string {
+  const s = SESSION_SERIES[ph];
+  if (s) return s[0];
+  return ph.replace(/^1 sessions/, '1 session');
 }
 
 function StepIcon({ s }: { s: StepState['status'] }) {

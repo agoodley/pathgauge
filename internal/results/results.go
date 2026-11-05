@@ -128,6 +128,10 @@ func NewResult(test string) any {
 		return &Integrity{}
 	case "voip":
 		return &VoIP{}
+	case "mix":
+		return &Mix{}
+	case "capacity":
+		return &Capacity{}
 	case "sweep":
 		return &Sweep{}
 	case "sizesweep":
@@ -602,4 +606,139 @@ type QoS struct {
 	UpMbps    float64    `json:"up_mbps"`
 	Effective bool       `json:"priority_effective"`
 	Verdict   string     `json:"verdict"`
+}
+
+// Mix is the traffic-mix test: simulated application sessions (calls,
+// browsing, streaming, transfers) running at once. When the mix includes
+// bulk transfers it runs twice, first without them and then with them,
+// so the result shows what the transfers do to everything else.
+type Mix struct {
+	Spec      string     `json:"spec"`
+	Scenario  string     `json:"scenario,omitempty"`
+	Counts    []MixCount `json:"counts"`
+	BaseRTTms float64    `json:"base_rtt_ms"`
+	DSCP      bool       `json:"dscp"`
+	Phases    []MixPhase `json:"phases"`
+	Verdict   string     `json:"verdict"`
+	Notes     []string   `json:"notes,omitempty"`
+}
+
+// MixCount is how many sessions of one kind the mix ran.
+type MixCount struct {
+	Kind  string `json:"kind"`
+	Label string `json:"label"`
+	Count int    `json:"count"`
+}
+
+// MixPhase is one run of the mix.
+type MixPhase struct {
+	Name          string        `json:"name"` // interactive, with-transfers or all
+	Label         string        `json:"label"`
+	WithTransfers bool          `json:"with_transfers"`
+	DurationS     float64       `json:"duration_s"`
+	ProbeRTT      stats.Summary `json:"probe_rtt_ms"`
+	Kinds         []MixKind     `json:"kinds"`
+	Sessions      []MixSession  `json:"sessions"`
+	Verdict       string        `json:"verdict"`
+}
+
+// MixKind summarises the sessions of one kind in a phase.
+type MixKind struct {
+	Kind       string  `json:"kind"`
+	Label      string  `json:"label"`
+	Sessions   int     `json:"sessions"`
+	Good       int     `json:"good"`
+	Acceptable int     `json:"acceptable"`
+	Poor       int     `json:"poor"`
+	Verdict    string  `json:"verdict,omitempty"` // worst session; empty for transfers
+	Metric     string  `json:"metric"`            // what Value is, e.g. "worst MOS"
+	Value      float64 `json:"value"`
+	Unit       string  `json:"unit"`
+	Summary    string  `json:"summary"`
+}
+
+// MixSession is one simulated application session.
+type MixSession struct {
+	ID      string   `json:"id"`
+	Kind    string   `json:"kind"`
+	Verdict string   `json:"verdict,omitempty"`
+	Error   string   `json:"error,omitempty"`
+	Up      *MixFlow `json:"up,omitempty"`   // real-time sessions: client to endpoint
+	Down    *MixFlow `json:"down,omitempty"` // real-time sessions: endpoint to client
+	// TCP sessions.
+	Mbps     float64        `json:"mbps,omitempty"`
+	Times    *stats.Summary `json:"times_ms,omitempty"` // page loads or chunk downloads
+	Count    int            `json:"count,omitempty"`
+	Errors   int            `json:"errors,omitempty"`
+	TargetMs float64        `json:"target_ms,omitempty"` // streaming: play time per chunk
+}
+
+// MixFlow is one direction of a real-time session.
+type MixFlow struct {
+	LossPct    float64 `json:"loss_pct"`
+	JitterMs   float64 `json:"jitter_ms"`
+	DelayMs    float64 `json:"delay_ms"`     // estimated one-way delay (median)
+	AddedP50Ms float64 `json:"added_p50_ms"` // delay added by queues, vs the idle path
+	AddedP95Ms float64 `json:"added_p95_ms"`
+	LatePct    float64 `json:"late_pct,omitempty"` // voice: arrived after the adaptive jitter buffer played it
+	// PlayoutMs is the mean delay queues plus the receiver's adaptive jitter
+	// buffer add over the idle path (voice): what the listener hears.
+	PlayoutMs float64    `json:"playout_ms,omitempty"`
+	MOS       float64    `json:"mos,omitempty"`
+	R         float64    `json:"r,omitempty"`
+	Frames    *MixFrames `json:"frames,omitempty"` // video
+	Verdict   string     `json:"verdict"`
+}
+
+// MixFrames summarises how video frames arrived.
+type MixFrames struct {
+	Frames  int     `json:"frames"`
+	OKPct   float64 `json:"ok_pct"`   // complete and on time
+	LatePct float64 `json:"late_pct"` // arrived after their playout time
+	// RepairedPct lost packets but were repaired by retransmission;
+	// LostPct could not be repaired at all.
+	RepairedPct float64 `json:"repaired_pct"`
+	LostPct     float64 `json:"lost_pct"`
+	Freezes     int     `json:"freezes"` // runs of bad frames of 200 ms or more
+	FreezeS     float64 `json:"freeze_s"`
+	DelayP50Ms  float64 `json:"delay_p50_ms"` // added network delay per frame
+	DelayP95Ms  float64 `json:"delay_p95_ms"`
+	PlayoutMs   float64 `json:"playout_ms"` // mean delay added by queues plus the jitter buffer
+}
+
+// Capacity is how many simultaneous calls of one kind the path carries,
+// searched by adding calls until quality drops, on their own and while
+// bulk transfers run in both directions.
+type Capacity struct {
+	Kind           string          `json:"kind"` // voice or video
+	Label          string          `json:"label"`
+	PerSessionKbps float64         `json:"per_session_kbps"` // each direction, including headers
+	StepS          float64         `json:"step_s"`
+	Alone          CapacitySearch  `json:"alone"`
+	WithTransfers  *CapacitySearch `json:"with_transfers,omitempty"`
+}
+
+// CapacitySearch is one capacity search.
+type CapacitySearch struct {
+	Steps []CapacityStep `json:"steps"`
+	// Good is the most sessions with every session good; Acceptable the
+	// most with none poor.
+	Good       int `json:"good"`
+	Acceptable int `json:"acceptable"`
+	// Limit is set when the search stopped before quality dropped: the
+	// largest count tried, and why ("rate cap" or "session cap").
+	Limit       int    `json:"limit,omitempty"`
+	LimitReason string `json:"limit_reason,omitempty"`
+}
+
+// CapacityStep is one count of simultaneous sessions.
+type CapacityStep struct {
+	Sessions   int     `json:"sessions"`
+	Good       int     `json:"good"`
+	Acceptable int     `json:"acceptable"`
+	Poor       int     `json:"poor"`
+	Worst      float64 `json:"worst"` // worst MOS (voice) or frames-on-time % (video)
+	LossPct    float64 `json:"loss_pct"`
+	AddedP95Ms float64 `json:"added_p95_ms"`
+	Verdict    string  `json:"verdict"`
 }

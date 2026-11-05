@@ -903,6 +903,7 @@ Example scenarios:
 > **Status (November 2026).** Built and tested:
 > - Phases 0–6.
 > - Most of the Phase 3 and Phase 4 test catalogue.
+> - A traffic mix (simulated voice and video calls, gaming, browsing, streaming and transfers at once, graded per session) and a call-capacity search.
 >
 > Still to do:
 > - The Phase 7 items.

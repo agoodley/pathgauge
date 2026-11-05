@@ -29,6 +29,30 @@ type UDPSink struct {
 	// Socket overflow counter at the first and latest packet.
 	dropsFirst, dropsLast uint32
 	haveDrops             bool
+	// Optional per-packet log (video frame analysis).
+	log    *PacketLog
+	logMax int
+}
+
+// PacketLog records every packet of a stream: its sequence number, its send
+// time (sender clock) and its arrival time (receiver clock), in
+// microseconds after BaseNs. The two clocks may be offset; only differences
+// between packets are meaningful.
+type PacketLog struct {
+	BaseNs int64    `json:"base_ns"`
+	Seq    []uint64 `json:"seq"`
+	T1Us   []int64  `json:"t1_us"`
+	RxUs   []int64  `json:"rx_us"`
+}
+
+// maxLogPackets bounds the packet log (about 4 MB of JSON).
+const maxLogPackets = 200_000
+
+// EnableLog makes the sink keep a per-packet log.
+func (s *UDPSink) EnableLog() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.log, s.logMax = &PacketLog{}, maxLogPackets
 }
 
 type sinkBin struct {
@@ -68,6 +92,14 @@ func (s *UDPSink) Add(h proto.UDPHeader, size int, rx time.Time, ri netx.RecvInf
 		s.last = rx
 	}
 	s.seq.Add(h.Seq)
+	if s.log != nil && len(s.log.Seq) < s.logMax {
+		if len(s.log.Seq) == 0 {
+			s.log.BaseNs = h.T1
+		}
+		s.log.Seq = append(s.log.Seq, h.Seq)
+		s.log.T1Us = append(s.log.T1Us, (h.T1-s.log.BaseNs)/1000)
+		s.log.RxUs = append(s.log.RxUs, (rx.UnixNano()-s.log.BaseNs)/1000)
+	}
 	s.jitter.Add(owd)
 	if len(s.owd) < maxOWDSamples {
 		s.owd = append(s.owd, float32(owd))
@@ -112,6 +144,8 @@ type SinkResult struct {
 	// LatePct is the share of received packets whose delay exceeds the
 	// stream's minimum by more than N ms (jitter-buffer late loss), by N.
 	LatePct map[int]float64 `json:"late_pct"`
+	// Packets is the per-packet log, when the sink was asked to keep one.
+	Packets *PacketLog `json:"packets,omitempty"`
 }
 
 // SinkBinResult is one bin of a SinkResult.
@@ -136,6 +170,10 @@ func (s *UDPSink) Result(sent uint64) SinkResult {
 	}
 	if s.haveDrops {
 		r.HostDrops = int64(s.dropsLast - s.dropsFirst)
+	}
+	if s.log != nil {
+		l := *s.log
+		r.Packets = &l
 	}
 	if !s.first.IsZero() {
 		r.Seconds = s.last.Sub(s.first).Seconds()

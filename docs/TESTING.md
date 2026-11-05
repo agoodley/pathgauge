@@ -7,7 +7,7 @@ PathGauge is tested in layers. The aim is that measurements are proven correct a
 | Unit tests | Maths and logic: percentiles, RFC 3550 jitter, loss/reorder/duplicate/burst tracking, MOS, grades, the Mathis bound, the wire protocol and MACs, config and policy validation, `doctor` against simulated Rocky 8 / Ubuntu hosts, the diagnosis rules (from fixtures), sweep classification, PMTU bisection, DSCP/ECN classification, traceroute loss interpretation, the pacer (including a regression test for a slow sender), password hashing, alert evaluation, monitoring rollups | `make test` |
 | Loopback integration | A real endpoint and client in one process: latency, TCP both directions with live intervals and sender `TCP_INFO`, stream scaling, wrong-key rejection | `go test ./internal/engine/` |
 | Server + agent integration | An in-process server and agent over real TLS and WebSockets (detailed below) | `go test ./internal/server/` |
-| Network-namespace lab | 17 scenarios, each building a known fault with tc, nftables and netem, then checking PathGauge's measurements **and** diagnosis (see below) | `make lab-scenarios` |
+| Network-namespace lab | 21 scenarios, each building a known fault with tc, nftables and netem, then checking PathGauge's measurements **and** diagnosis (see below) | `make lab-scenarios` |
 | Packages | Install, reinstall (configuration kept), remove, ownership and permissions, `systemd-analyze verify` on Ubuntu 22.04/24.04/26.04 and Rocky 8/9/10 | `make install-test` |
 | Packaged end to end | The RPM installed in systemd containers, a **Rocky 9 server and a Rocky 8 agent**, put through the full server/agent workflow (detailed below) | `make e2e` |
 | Real world | Peer and server modes over the internet across three continents (client behind NAT, on Wi-Fi), including the SQM tuner shaping a live VPS | manual |
@@ -56,4 +56,8 @@ The lab (`lab/netns.sh`) has two endpoints with two routers between them. Delay,
 | unprivileged | runs as `nobody` | Fallback traceroute, TCP, PMTU and ICMP handling without privileges |
 | qos_fifo | 30 Mbit/s FIFO with a 200 ms buffer | EF latency rises like best effort: priority "ineffective" |
 | qos_prio | The same, with strict priority for EF | EF stays fast while best effort queues: priority "effective" |
+| mix_fifo | 20/5 Mbit/s FIFO with 200/600 ms buffers; mix of 4 voice calls, a video call, a web user and a download and upload | Calls good without transfers; voice and video poor with them (MOS drops by more than 1); "degraded" findings |
+| mix_cake | the same rates with CAKE | Calls stay good while transfers run; browsing good; no voice "degraded" finding |
+| mix_prio | 20/10 Mbit/s FIFO with strict priority for EF | Marked voice stays good under transfers; video (AF41, not prioritised) is poor |
+| capacity | 4 Mbit/s each way with fq_codel | Voice capacity 30–56 calls (about 50 fit), 20–56 while transfers run |
 | ipv6 | IPv6 through both routers, 1400-byte link | RTT, 3 hops, TCP and UDP, path MTU 1400 each way from Packet Too Big, DSCP preserved through the traffic class, hop limits |

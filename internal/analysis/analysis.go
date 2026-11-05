@@ -540,6 +540,20 @@ func Analyze(r *results.Report, exp Expectations) {
 		}
 	}
 
+	// ---- traffic mix and call capacity ----
+	mixes, mixIDs := all[results.Mix](v, "mix")
+	for i, m := range mixes {
+		for _, x := range mixFindings(m, mixIDs[i]) {
+			add(x)
+		}
+	}
+	caps, capIDs := all[results.Capacity](v, "capacity")
+	for i, cp := range caps {
+		for _, x := range capacityFindings(cp, capIDs[i]) {
+			add(x)
+		}
+	}
+
 	// ---- comparisons ----
 	if cc, ccID := first[results.CCCompare](v, "cc"); cc != nil {
 		var cubic, bbr float64

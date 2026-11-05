@@ -5,12 +5,14 @@ import { usePalette, type Palette } from '../lib/theme';
 import { f1, f2, f0, fmtBytes, fmtMbps, fmtMs, fmtPct, isNum, rateScale } from '../lib/format';
 import type {
   BloatResult,
+  CapacityResult,
   CCResult,
   DiscriminationResult,
   HostReport,
   InfoResult,
   IntegrityResult,
   LatencyResult,
+  MixResult,
   PMTUDir,
   PMTUResult,
   QoSResult,
@@ -30,6 +32,7 @@ import { barOption, Figure, lineOption, type LineSeries } from './Chart';
 import { Badge, DataTable } from './ui';
 import { CheckBadge, HostSummaryLine } from './HostDiag';
 import { GradeBadge } from './shared';
+import { CapacityView, MixView, capacityHeadline, mixHeadline } from './MixResult';
 
 const sumHead = ['Measure', 'Samples', 'Min', 'Median', 'Mean', 'p95', 'p99', 'Max', 'Std dev'];
 function sumRow(label: string, s: StatSummary | null | undefined): ReactNode[] {
@@ -109,6 +112,10 @@ export function StepBody({ step }: { step: Step }) {
       return <SQMView v={r as SQMResult} />;
     case 'qos':
       return <QoSView v={r as QoSResult} />;
+    case 'mix':
+      return <MixView v={r as MixResult} />;
+    case 'capacity':
+      return <CapacityView v={r as CapacityResult} />;
   }
   return (
     <details>
@@ -153,6 +160,10 @@ export function stepHeadline(test: string, r: unknown): string {
         return `max ${f0((r as SizeSweepResult).max_pps)} packets/s`;
       case 'qos':
         return (r as QoSResult).priority_effective ? 'priority protects latency' : 'priority not effective';
+      case 'mix':
+        return mixHeadline(r as MixResult);
+      case 'capacity':
+        return capacityHeadline(r as CapacityResult);
     }
   } catch {
     return '';
