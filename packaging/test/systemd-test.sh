@@ -26,9 +26,11 @@ echo "== $PRETTY_NAME"
 # agent with it through the CLI first (as an administrator would).
 echo 'systemd-test-password' > /root/pw
 pathgauge server init --admin admin --password-file /root/pw --enable >/dev/null || fail "server init"
-for _ in $(seq 1 20); do
-    systemctl is-active --quiet pathgauge-server.service && break
-    sleep 1
+# "active" means the process started, not that it listens yet: wait for
+# the control port itself.
+for _ in $(seq 1 40); do
+    ss -ltn | grep -q ':7443 ' && break
+    sleep 0.5
 done
 token=$(pathgauge server join-token --url "https://$(hostname):7443" | grep -o 'pgjoin_[a-z0-9_]*' | head -1)
 [ -n "$token" ] || fail "no join token"
