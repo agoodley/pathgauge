@@ -59,6 +59,9 @@ jobs:
       # black hole, MSS clamping, DSCP bleaching, NAT, SQM tuner...) must be
       # measured and diagnosed correctly.
       - run: sudo OUT=/tmp/pathgauge-lab lab/scenarios.sh "$PWD/bin/pathgauge"
+      # The lab runs as root; let the upload step read its results.
+      - if: always()
+        run: sudo chmod -R a+rX /tmp/pathgauge-lab || true
       - uses: actions/upload-artifact@v4
         if: always()
         with:

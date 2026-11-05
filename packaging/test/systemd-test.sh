@@ -22,6 +22,18 @@ fi
 . /etc/os-release
 echo "== $PRETTY_NAME"
 
+# The agent only runs once enrolled, so set up the server and enrol the
+# agent with it through the CLI first (as an administrator would).
+echo 'systemd-test-password' > /root/pw
+pathgauge server init --admin admin --password-file /root/pw --enable >/dev/null || fail "server init"
+for _ in $(seq 1 20); do
+    systemctl is-active --quiet pathgauge-server.service && break
+    sleep 1
+done
+token=$(pathgauge server join-token --url "https://$(hostname):7443" | grep -o 'pgjoin_[a-z0-9_]*' | head -1)
+[ -n "$token" ] || fail "no join token"
+pathgauge agent join "https://$(hostname):7443" --token "$token" --name systemd-test >/dev/null || fail "agent join"
+
 for role in server agent; do
     unit=pathgauge-$role.service
     systemctl enable --now "$unit" >/dev/null 2>&1
@@ -38,6 +50,9 @@ done
 
 [ "$(stat -c '%U:%G %a' /var/lib/pathgauge)" = "pathgauge:pathgauge 750" ] || fail "state directory ownership wrong"
 
-systemctl stop pathgauge-server.service pathgauge-agent.service
-journalctl --no-pager -u pathgauge-agent.service | grep -q "agent stopping" || fail "agent did not shut down cleanly"
+systemctl stop pathgauge-agent.service pathgauge-server.service
+for role in agent server; do
+    result=$(systemctl show -p Result --value "pathgauge-$role.service")
+    [ "$result" = success ] || fail "pathgauge-$role did not stop cleanly (result: $result)"
+done
 echo "PASS: services start, run unprivileged with CAP_NET_ADMIN+CAP_NET_RAW, and stop cleanly"
