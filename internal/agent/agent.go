@@ -24,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
@@ -107,8 +108,12 @@ func JoinWith(ctx context.Context, o JoinOptions) (*Identity, error) {
 	if name == "" {
 		name, _ = os.Hostname()
 	}
+	// The HTTP transport reports progress from its own goroutines.
+	var dmu sync.Mutex
 	debugf := func(format string, a ...any) {
 		if o.Debug != nil {
+			dmu.Lock()
+			defer dmu.Unlock()
 			fmt.Fprintf(o.Debug, format+"\n", a...)
 		}
 	}
@@ -168,15 +173,15 @@ func JoinWith(ctx context.Context, o JoinOptions) (*Identity, error) {
 	host := hostinfo.Collect(hostinfo.SystemSources())
 	hostJSON, _ := json.Marshal(host)
 	body, _ := json.Marshal(agentproto.EnrollRequest{Token: o.Token, Name: name, CSR: string(csrPEM), Version: version.Get().Version, Host: hostJSON})
-	var wrote, answered bool
+	var wrote, answered atomic.Bool
 	start := time.Now()
 	trace := &httptrace.ClientTrace{
 		WroteRequest: func(httptrace.WroteRequestInfo) {
-			wrote = true
+			wrote.Store(true)
 			debugf("enrolment request sent (%d bytes) after %.1f ms", len(body), float64(time.Since(start).Microseconds())/1000)
 		},
 		GotFirstResponseByte: func() {
-			answered = true
+			answered.Store(true)
 			debugf("server answered after %.1f ms", float64(time.Since(start).Microseconds())/1000)
 		},
 	}
@@ -186,9 +191,9 @@ func JoinWith(ctx context.Context, o JoinOptions) (*Identity, error) {
 	resp, err := client.Do(req)
 	if err != nil {
 		switch {
-		case !wrote:
+		case !wrote.Load():
 			return nil, fmt.Errorf("enroll with %s: sending the request failed: %w", u.Host, err)
-		case !answered:
+		case !answered.Load():
 			return nil, fmt.Errorf("enroll with %s: the request was sent but the server never answered (%w). "+
 				"Check the server's log (journalctl -u pathgauge-server); if the server is fine, run 'pathgauge agent diagnose %s'", u.Host, err, u.String())
 		}
