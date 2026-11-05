@@ -1,0 +1,23 @@
+# PathGauge agent configuration.
+# Unknown keys are rejected, so a typo fails loudly at start-up.
+# Check this file with:  pathgauge agent run --check-config
+
+# Name shown in the dashboard. Empty means this machine's hostname.
+name: ""
+
+# Written by `pathgauge agent join https://<server>:7443 --token <token>`.
+server_url: ""
+
+# Test traffic (TCP and UDP). Only needs to be reachable for agent-to-agent
+# tests; tests with the server are always opened from this side.
+data_plane:
+  listen: ":7400"
+
+data_dir: /var/lib/pathgauge
+
+# Local safety policy. The server can read it but never override it.
+policy_file: /etc/pathgauge/policy.yaml
+
+log:
+  level: info     # debug | info | warn | error
+  format: auto    # auto (text; no timestamps under journald) | text | json

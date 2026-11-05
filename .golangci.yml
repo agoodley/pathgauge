@@ -1,0 +1,47 @@
+version: "2"
+
+linters:
+  default: standard
+  enable:
+    - errorlint
+    - gosec
+    - misspell
+    - unconvert
+    - usestdlibvars
+  settings:
+    misspell:
+      locale: UK
+      # CSS keywords and API names are US spellings by definition.
+      ignore-rules: [color, colors, center, centered, behavior, initialize, analyze, summarize, organization, ect, enroll, enrolls, enrolled, enrollment]
+    gosec:
+      excludes:
+        - G103 # unsafe: only used to read kernel control-message structs (internal/netx, audited)
+        - G104 # unhandled errors: errcheck covers this (with the std-error-handling preset)
+        - G115 # integer conversions: protocol fields and timestamps are bounded by construction
+        - G204 # subprocesses with variable arguments: tc/ip are invoked deliberately, never through a shell
+        - G304 # file paths from variables: config and /proc paths are expected
+        - G401 # sha1: used only for route fingerprints, not security
+        - G404 # math/rand: used only to seed the incompressible payload pool, not security
+        - G505 # sha1 import (see G401)
+  exclusions:
+    presets:
+      - std-error-handling # unchecked Close/Flush/print errors
+      - common-false-positives
+    rules:
+      - path: _test\.go
+        linters: [errcheck, gosec, usestdlibvars]
+      - path: internal/report/
+        linters: [gosec]
+        text: G203 # report HTML is built from escaped strings (html.EscapeString) by design
+      - path: internal/pki/
+        linters: [gosec]
+        text: G306 # certificates are public; private keys are written 0600
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/agoodley/pathgauge

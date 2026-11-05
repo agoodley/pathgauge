@@ -1,0 +1,30 @@
+# PathGauge server configuration.
+# Unknown keys are rejected, so a typo fails loudly at start-up.
+# Check this file with:  pathgauge server run --check-config
+
+# Dashboard (HTTPS), REST API and agent control channel (gRPC over mTLS).
+listen: ":7443"
+
+# Test traffic (TCP and UDP). Agents connect here, so it must be reachable from them.
+data_plane:
+  listen: ":7400"
+
+# Database, certificates, reports. Created by systemd (StateDirectory=pathgauge).
+data_dir: /var/lib/pathgauge
+
+log:
+  level: info     # debug | info | warn | error
+  format: auto    # auto (text; no timestamps under journald) | text | json
+
+# Extra DNS names or IP addresses for the server's TLS certificate. The
+# hostname and local addresses are always included.
+# names: ["pathgauge.example.com"]
+
+# Days of monitoring samples to keep.
+retention_days: 90
+
+# Optional: also accept "pathgauge test <server> --key <peer_key>" clients
+# without enrolling them (set under data_plane):
+#   data_plane:
+#     listen: ":7400"
+#     peer_key: "pg_..."

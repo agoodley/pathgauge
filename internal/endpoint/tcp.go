@@ -1,0 +1,272 @@
+package endpoint
+
+import (
+	"context"
+	"encoding/hex"
+	"errors"
+	"net"
+	"sync"
+	"time"
+
+	"github.com/agoodley/pathgauge/internal/flow"
+	"github.com/agoodley/pathgauge/internal/netx"
+	"github.com/agoodley/pathgauge/internal/proto"
+)
+
+// TCPPrepare asks the endpoint to take part in a TCP test.
+type TCPPrepare struct {
+	Role         string `json:"role"` // endpoint's role: send, recv, hold
+	Streams      int    `json:"streams"`
+	DurationMs   int    `json:"duration_ms"`
+	IntervalMs   int    `json:"interval_ms"`
+	Congestion   string `json:"congestion,omitempty"`
+	PacingBps    uint64 `json:"pacing_bps,omitempty"` // per stream, bytes/s
+	BufferBytes  int    `json:"buffer_bytes,omitempty"`
+	Compressible bool   `json:"compressible,omitempty"`
+	Live         bool   `json:"live,omitempty"`
+	// Bytes, if > 0, makes a sending endpoint stop after this many bytes
+	// per stream (short-flow tests).
+	Bytes uint64 `json:"bytes,omitempty"`
+}
+
+// TCPPrepared lists the stream IDs to connect.
+type TCPPrepared struct {
+	TestID  string   `json:"test_id"`
+	Streams []uint32 `json:"streams"`
+}
+
+// TCPStreamResult is the endpoint's view of one stream.
+type TCPStreamResult struct {
+	Stream     uint32              `json:"stream"`
+	Bytes      uint64              `json:"bytes"`
+	Congestion string              `json:"congestion"`
+	Final      netx.TCPInfoSummary `json:"final"`
+}
+
+// TCPResult is the endpoint's view of a TCP test.
+type TCPResult struct {
+	TestID     string            `json:"test_id"`
+	Role       string            `json:"role"`
+	IntervalMs int               `json:"interval_ms"`
+	Streams    []TCPStreamResult `json:"streams"`
+	Samples    []flow.Sample     `json:"samples"`
+	Error      string            `json:"error,omitempty"`
+}
+
+// TCPSampleEvent streams live samples to the client.
+type TCPSampleEvent struct {
+	TestID string      `json:"test_id"`
+	Sample flow.Sample `json:"sample"`
+}
+
+type tcpTest struct {
+	ss       *session
+	id       string
+	p        TCPPrepare
+	ids      []uint32
+	streams  []*flow.Stream
+	mu       sync.Mutex
+	attached int
+	started  bool
+	allIn    chan struct{}
+	done     chan struct{}
+	sampler  flow.Sampler
+	err      error
+	timer    *time.Timer
+}
+
+func (ss *session) tcpPrepare(p TCPPrepare) (TCPPrepared, error) {
+	if p.Streams < 1 || p.Streams > 128 {
+		return TCPPrepared{}, errors.New("streams must be 1-128")
+	}
+	if p.Role != "send" && p.Role != "recv" && p.Role != "hold" {
+		return TCPPrepared{}, errors.New("role must be send, recv or hold")
+	}
+	if err := ss.checkDuration(time.Duration(p.DurationMs) * time.Millisecond); err != nil {
+		return TCPPrepared{}, err
+	}
+	if p.PacingBps > 0 {
+		if err := ss.checkRate(float64(p.PacingBps) * 8 * float64(p.Streams)); err != nil {
+			return TCPPrepared{}, err
+		}
+	}
+	idb := make([]byte, 8)
+	copy(idb, proto.NewNonce())
+	t := &tcpTest{
+		ss: ss, id: hex.EncodeToString(idb), p: p,
+		ids: ss.allocStreams(p.Streams), streams: make([]*flow.Stream, p.Streams),
+		allIn: make(chan struct{}), done: make(chan struct{}),
+	}
+	t.sampler.Interval = time.Duration(max(p.IntervalMs, 20)) * time.Millisecond
+	ss.mu.Lock()
+	ss.tests[t.id] = t
+	for _, id := range t.ids {
+		ss.slots[id] = t
+	}
+	ss.mu.Unlock()
+	// Start with whatever connected if some streams never arrive.
+	t.timer = time.AfterFunc(10*time.Second, func() { t.start() })
+	return TCPPrepared{TestID: t.id, Streams: t.ids}, nil
+}
+
+func (ss *session) attachStream(id uint32, c *net.TCPConn) {
+	ss.mu.Lock()
+	t := ss.slots[id]
+	delete(ss.slots, id)
+	ss.mu.Unlock()
+	if t == nil {
+		c.Close()
+		return
+	}
+	idx := -1
+	for i, sid := range t.ids {
+		if sid == id {
+			idx = i
+		}
+	}
+	_ = netx.SetCongestion(c, t.p.Congestion)
+	_ = netx.SetPacingRate(c, t.p.PacingBps)
+	netx.SetBuffers(c, t.p.BufferBytes)
+	t.mu.Lock()
+	t.streams[idx] = &flow.Stream{ID: id, Conn: c}
+	t.attached++
+	all := t.attached == len(t.ids)
+	t.mu.Unlock()
+	if all {
+		t.start()
+	}
+}
+
+func (t *tcpTest) start() {
+	t.mu.Lock()
+	if t.started {
+		t.mu.Unlock()
+		return
+	}
+	t.started = true
+	t.timer.Stop()
+	var streams []*flow.Stream
+	for _, s := range t.streams {
+		if s != nil {
+			streams = append(streams, s)
+		}
+	}
+	t.streams = streams
+	t.mu.Unlock()
+	close(t.allIn)
+	if len(streams) == 0 {
+		t.err = errors.New("no data connections arrived")
+		close(t.done)
+		return
+	}
+	go t.run(streams)
+}
+
+func (t *tcpTest) run(streams []*flow.Stream) {
+	defer close(t.done)
+	if t.p.Role == "hold" {
+		<-t.ss.ctx.Done()
+		return
+	}
+	d := time.Duration(t.p.DurationMs) * time.Millisecond
+	var ctx context.Context
+	var cancel context.CancelFunc
+	if t.p.Role == "send" {
+		ctx, cancel = context.WithTimeout(t.ss.ctx, d)
+	} else {
+		// The client closes its streams; allow grace for late data.
+		ctx, cancel = context.WithTimeout(t.ss.ctx, d+10*time.Second)
+	}
+	defer cancel()
+	var onSample func(flow.Sample)
+	if t.p.Live {
+		onSample = func(s flow.Sample) { t.ss.event("tcp_sample", TCPSampleEvent{TestID: t.id, Sample: s}) }
+	}
+	sctx, scancel := context.WithCancel(ctx)
+	sampDone := make(chan struct{})
+	go func() {
+		t.sampler.Run(sctx, streams, onSample)
+		close(sampDone)
+	}()
+	var wg sync.WaitGroup
+	for _, s := range streams {
+		wg.Add(1)
+		go func(s *flow.Stream) {
+			defer wg.Done()
+			if t.p.Role == "send" {
+				_ = s.Send(ctx, 128<<10, t.p.Compressible, t.p.Bytes)
+				_ = s.Conn.CloseWrite()
+			} else {
+				_ = s.Receive(ctx)
+			}
+		}(s)
+	}
+	wg.Wait()
+	scancel()
+	<-sampDone
+}
+
+func (t *tcpTest) closeAll() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for _, s := range t.streams {
+		if s != nil && s.Conn != nil {
+			s.Conn.Close()
+		}
+	}
+}
+
+func (ss *session) tcpResult(id string, wait time.Duration) (TCPResult, error) {
+	ss.mu.Lock()
+	t := ss.tests[id]
+	ss.mu.Unlock()
+	if t == nil {
+		return TCPResult{}, errors.New("unknown test")
+	}
+	if t.p.Role == "hold" {
+		return ss.connInfo(t), nil
+	}
+	select {
+	case <-t.done:
+	case <-time.After(wait):
+		return TCPResult{}, errors.New("timed out waiting for the test to finish")
+	}
+	r := TCPResult{TestID: id, Role: t.p.Role, IntervalMs: int(t.sampler.Interval / time.Millisecond), Samples: t.sampler.Samples()}
+	if t.err != nil {
+		r.Error = t.err.Error()
+	}
+	for _, s := range t.streams {
+		sr := TCPStreamResult{Stream: s.ID, Bytes: s.Bytes(), Congestion: netx.Congestion(s.Conn)}
+		if ti, err := netx.TCPInfo(s.Conn); err == nil {
+			sr.Final = netx.Summarize(ti)
+		}
+		r.Streams = append(r.Streams, sr)
+		s.Conn.Close()
+	}
+	ss.mu.Lock()
+	delete(ss.tests, id)
+	ss.mu.Unlock()
+	return r, nil
+}
+
+// connInfo reports TCP_INFO for held connections (middlebox checks).
+func (ss *session) connInfo(t *tcpTest) TCPResult {
+	select {
+	case <-t.allIn:
+	case <-time.After(5 * time.Second):
+	}
+	r := TCPResult{TestID: t.id, Role: "hold"}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for _, s := range t.streams {
+		if s == nil {
+			continue
+		}
+		sr := TCPStreamResult{Stream: s.ID, Congestion: netx.Congestion(s.Conn)}
+		if ti, err := netx.TCPInfo(s.Conn); err == nil {
+			sr.Final = netx.Summarize(ti)
+		}
+		r.Streams = append(r.Streams, sr)
+	}
+	return r
+}

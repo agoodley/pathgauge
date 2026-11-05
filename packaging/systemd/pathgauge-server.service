@@ -1,0 +1,49 @@
+[Unit]
+Description=PathGauge server (dashboard, API, orchestration)
+Documentation=https://github.com/agoodley/pathgauge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pathgauge
+Group=pathgauge
+ExecStart=/usr/bin/pathgauge server run --config /etc/pathgauge/server.yaml
+Restart=on-failure
+RestartSec=5s
+# Many parallel test streams need many sockets.
+LimitNOFILE=65536
+
+# /var/lib/pathgauge, owned by the service user.
+StateDirectory=pathgauge
+StateDirectoryMode=0750
+
+# Only the network capabilities testing needs; the service never runs as root.
+#   CAP_NET_RAW:   ICMP probes, TCP-SYN traceroute, packet capture
+#   CAP_NET_ADMIN: tc shaping (inherited by /usr/sbin/tc), SO_MARK, forced socket buffers
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+
+# Sandboxing. Notes:
+#   - No ProtectClock: it blocks the read-only adjtimex call used to check
+#     clock synchronisation for one-way delay.
+#   - systemd < 242 (Rocky 8) ignores ProtectKernelLogs and ProtectHostname
+#     with a harmless warning.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET
+
+[Install]
+WantedBy=multi-user.target

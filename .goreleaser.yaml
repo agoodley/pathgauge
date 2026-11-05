@@ -1,0 +1,142 @@
+# GoReleaser configuration: builds static Linux binaries and .deb/.rpm
+# packages for amd64 and arm64.
+#   Local snapshot:  make snapshot     (output in dist/)
+#   Release:         push a vX.Y.Z tag (see .github/workflows/release.yml)
+version: 2
+
+project_name: pathgauge
+
+before:
+  hooks:
+    - go mod tidy
+    - sh -c 'cd web && npm ci --no-audit --no-fund && npm run build'
+    - ./scripts/completions.sh
+
+builds:
+  - id: pathgauge
+    main: ./cmd/pathgauge
+    binary: pathgauge
+    env:
+      - CGO_ENABLED=0
+    goos: [linux]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w
+      - -X github.com/agoodley/pathgauge/internal/version.Version={{ .Version }}
+      - -X github.com/agoodley/pathgauge/internal/version.Commit={{ .ShortCommit }}
+      - -X github.com/agoodley/pathgauge/internal/version.Date={{ .CommitDate }}
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - id: tarball
+    formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - README.md
+      - LICENSE
+      - NOTICE
+      - completions/*
+      - packaging/systemd/*
+      - packaging/config/*
+
+checksum:
+  name_template: checksums.txt
+
+nfpms:
+  - id: packages
+    package_name: pathgauge
+    # GitHub renames "~" to "." in uploaded asset names, so use "." in the
+    # file names too; otherwise checksums.txt names files that don't exist.
+    # The version inside the package keeps "~" so 0.1.0~rc.1 < 0.1.0.
+    file_name_template: '{{ replace .ConventionalFileName "~" "." }}'
+    vendor: PathGauge project
+    homepage: https://github.com/agoodley/pathgauge
+    maintainer: Andy Goodley <22671226+agoodley@users.noreply.github.com>
+    description: |-
+      Two-ended network diagnostics for Linux.
+      Measures throughput (single and parallel streams), latency, jitter, loss,
+      path hops, bufferbloat, MTU and middlebox behaviour between two machines,
+      with rate sweeps, traffic shaping experiments, a dashboard and reports.
+    license: Apache-2.0
+    formats: [deb, rpm]
+    bindir: /usr/bin
+    section: net
+    priority: optional
+    overrides:
+      deb:
+        dependencies: [iproute2, passwd]
+      rpm:
+        dependencies: [iproute, iproute-tc, shadow-utils]
+    contents:
+      - src: packaging/systemd/pathgauge-server.service
+        dst: /usr/lib/systemd/system/pathgauge-server.service
+      - src: packaging/systemd/pathgauge-agent.service
+        dst: /usr/lib/systemd/system/pathgauge-agent.service
+
+      - dst: /etc/pathgauge
+        type: dir
+        file_info:
+          mode: 0750
+          owner: root
+          group: pathgauge
+      - src: packaging/config/server.yaml
+        dst: /etc/pathgauge/server.yaml
+        type: config|noreplace
+        file_info:
+          mode: 0640
+          owner: root
+          group: pathgauge
+      - src: packaging/config/agent.yaml
+        dst: /etc/pathgauge/agent.yaml
+        type: config|noreplace
+        file_info:
+          mode: 0640
+          owner: root
+          group: pathgauge
+      - src: packaging/config/policy.yaml
+        dst: /etc/pathgauge/policy.yaml
+        type: config|noreplace
+        file_info:
+          mode: 0640
+          owner: root
+          group: pathgauge
+
+      - src: completions/pathgauge.bash
+        dst: /usr/share/bash-completion/completions/pathgauge
+      - src: completions/pathgauge.zsh
+        dst: /usr/share/zsh/site-functions/_pathgauge
+      - src: completions/pathgauge.fish
+        dst: /usr/share/fish/vendor_completions.d/pathgauge.fish
+
+      - src: README.md
+        dst: /usr/share/doc/pathgauge/README.md
+      - src: LICENSE
+        dst: /usr/share/licenses/pathgauge/LICENSE
+      - src: NOTICE
+        dst: /usr/share/licenses/pathgauge/NOTICE
+    scripts:
+      preinstall: packaging/scripts/preinstall.sh
+      postinstall: packaging/scripts/postinstall.sh
+      preremove: packaging/scripts/preremove.sh
+      postremove: packaging/scripts/postremove.sh
+
+snapshot:
+  version_template: "{{ incpatch .Version }}~dev{{ .ShortCommit }}"
+
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"
+      - "^chore:"
+
+release:
+  github:
+    owner: agoodley
+    name: pathgauge
+  draft: true
+  prerelease: auto

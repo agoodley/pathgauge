@@ -1,0 +1,18 @@
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+/graft/
+bin/
+dist/
+completions/
+internal/server/ui/dist/
+web/node_modules/
+web/test-results/
+web/playwright-report/
+# Dashboard (web/): dependencies, Playwright output and build caches.
+web/blob-report/
+web/.vite/
+web/*.tsbuildinfo
+local-reports/
+
+# Private working notes, kept locally and not published
+docs/OVERNIGHT.md
+docs/DECISIONS.md

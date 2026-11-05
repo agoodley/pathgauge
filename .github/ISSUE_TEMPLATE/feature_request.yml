@@ -1,0 +1,19 @@
+name: Feature request
+description: A new test, diagnosis, report or improvement
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What network problem are you trying to understand or prove?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would you like PathGauge to do?
+  - type: textarea
+    id: plan
+    attributes:
+      label: Related plan section
+      description: If this relates to docs/PLAN.md, name the section.

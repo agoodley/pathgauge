@@ -1,0 +1,36 @@
+name: Bug report
+description: Something measured wrongly, crashed, or failed to install
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: Include the exact command and its output.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: "`sudo pathgauge doctor` output from both ends"
+      description: Remove anything you consider private (hostnames, addresses).
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: "`pathgauge version` output"
+    validations:
+      required: true
+  - type: textarea
+    id: path
+    attributes:
+      label: The path between the two ends
+      description: For example "1 Gbit/s fibre, ~12 ms RTT, both ends wired", or "lab netns".

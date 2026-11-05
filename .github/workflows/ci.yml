@@ -1,0 +1,191 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Lint and unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then echo "Run gofmt on:"; echo "$unformatted"; exit 1; fi
+      - run: go vet ./...
+      - run: GOARCH=arm64 go vet ./...
+      - run: go test -race ./...
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: latest
+
+  licences:
+    name: Dependency licences
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - run: go install github.com/google/go-licenses/v2@latest
+      # Everything shipped must be compatible with Apache-2.0 (docs/PLAN.md §24).
+      - run: go-licenses check ./... --allowed_licenses=Apache-2.0,MIT,BSD-2-Clause,BSD-3-Clause,ISC
+
+  lab:
+    name: Network namespace lab
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq iperf3 ethtool nftables
+      - run: sudo lab/smoke.sh
+      - run: CGO_ENABLED=0 go build -o bin/pathgauge ./cmd/pathgauge
+      # Known faults (bufferbloat, policer, shaper, loss, reordering, PMTU
+      # black hole, MSS clamping, DSCP bleaching, NAT, SQM tuner...) must be
+      # measured and diagnosed correctly.
+      - run: sudo OUT=/tmp/pathgauge-lab lab/scenarios.sh "$PWD/bin/pathgauge"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lab-results
+          path: /tmp/pathgauge-lab
+          retention-days: 7
+
+  packages:
+    name: Build packages
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          version: "~> v2"
+          args: release --snapshot --clean
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages
+          path: |
+            dist/*.deb
+            dist/*.rpm
+            dist/*.tar.gz
+          retention-days: 7
+
+  install:
+    name: Install on ${{ matrix.image }}
+    needs: packages
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { image: "ubuntu:22.04", pattern: "*_amd64.deb" }
+          - { image: "ubuntu:24.04", pattern: "*_amd64.deb" }
+          - { image: "ubuntu:26.04", pattern: "*_amd64.deb" }
+          - { image: "rockylinux/rockylinux:8", pattern: "*.x86_64.rpm" }
+          - { image: "rockylinux/rockylinux:9", pattern: "*.x86_64.rpm" }
+          - { image: "rockylinux/rockylinux:10", pattern: "*.x86_64.rpm" }
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          name: packages
+          path: dist
+      - name: Install, inspect and remove
+        env:
+          IMAGE: ${{ matrix.image }}
+          PATTERN: ${{ matrix.pattern }}
+        run: |
+          pkg=$(find dist -name "$PATTERN" -printf "%f\n" | head -1)
+          docker run --rm -v "$PWD/dist:/dist:ro" -v "$PWD/packaging/test:/t:ro" \
+            "$IMAGE" /t/install-test.sh "/dist/$pkg"
+
+  systemd:
+    name: Services under systemd (${{ matrix.name }})
+    needs: packages
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: rocky9
+            pattern: "*.x86_64.rpm"
+            dockerfile: |
+              FROM rockylinux/rockylinux:9
+              RUN dnf install -y -q systemd iproute iproute-tc shadow-utils procps-ng && dnf clean all
+              CMD ["/usr/sbin/init"]
+          - name: ubuntu24
+            pattern: "*_amd64.deb"
+            dockerfile: |
+              FROM ubuntu:24.04
+              RUN apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq systemd systemd-sysv iproute2 procps
+              CMD ["/sbin/init"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          name: packages
+          path: dist
+      - name: Boot systemd and start both services
+        env:
+          DOCKERFILE: ${{ matrix.dockerfile }}
+          PATTERN: ${{ matrix.pattern }}
+        run: |
+          printf '%s\n' "$DOCKERFILE" | docker build -q -t nt-sd -
+          cid=$(docker run -d --privileged --cgroupns=private --tmpfs /run --tmpfs /run/lock \
+            -v "$PWD/dist:/dist:ro" -v "$PWD/packaging/test:/t:ro" nt-sd)
+          pkg=$(find dist -name "$PATTERN" -printf "%f\n" | head -1)
+          docker exec "$cid" /t/systemd-test.sh "/dist/$pkg"
+
+  e2e:
+    name: Packaged server + agent (Rocky 9 + Rocky 8, systemd)
+    needs: packages
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          name: packages
+          path: dist
+      - run: packaging/test/e2e-server-agent.sh
+
+  ui:
+    name: Dashboard build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: cd web && npm ci && npm run build
+
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,24 @@
+# PathGauge agent safety policy.
+# This file is enforced locally by the agent. The server cannot override it.
+
+# Highest offered load any test may generate, per direction.
+max_rate_mbps: 10000
+
+# Longest a single test step may run.
+max_test_duration: 30m
+
+# How much traffic shaping this agent accepts:
+#   none       - never shape
+#   interface  - shape the whole interface for the duration of a test lease
+#                (all traffic on the interface is affected while it runs)
+shaping: interface
+
+# Test IDs or prefixes this agent will run. Omit to allow every test.
+# allowed_tests: ["latency.*", "path.*", "throughput.*"]
+
+# Local-time windows when tests may run. Omit to allow any time.
+# allowed_hours: ["22:00-06:00"]
+
+# Extra peers (names or addresses) this agent may test against, beyond its
+# enrolled server. Omit to allow only the server.
+# allowed_peers: []
