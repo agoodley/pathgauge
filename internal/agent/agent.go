@@ -5,6 +5,7 @@ package agent
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -15,11 +16,13 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"os"
 	"os/user"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -36,6 +39,7 @@ import (
 	"github.com/agoodley/pathgauge/internal/shaping"
 	"github.com/agoodley/pathgauge/internal/stats"
 	"github.com/agoodley/pathgauge/internal/store"
+	"github.com/agoodley/pathgauge/internal/tlsprofile"
 	"github.com/agoodley/pathgauge/internal/version"
 )
 
@@ -45,6 +49,9 @@ type Identity struct {
 	Name      string `json:"name"`
 	ServerURL string `json:"server_url"`
 	DataKey   []byte `json:"data_key"`
+	// TLSProfile is the TLS profile enrolment found to work (empty: the
+	// default); the agent service opens its connections the same way.
+	TLSProfile string `json:"tls_profile,omitempty"`
 }
 
 func identityDir(dataDir string) string { return filepath.Join(dataDir, "agent") }
@@ -62,39 +69,129 @@ func LoadIdentity(dataDir string) (*Identity, error) {
 	return &id, json.Unmarshal(b, &id)
 }
 
+// JoinOptions controls enrolment.
+type JoinOptions struct {
+	URL, Token, Name, DataDir string
+	// TLSProfile is a tlsprofile name, or "auto" (or empty) to try each
+	// profile in turn and keep the first that gets an answer.
+	TLSProfile string
+	// Debug, if set, receives a step-by-step account of the connection.
+	Debug io.Writer
+	// HandshakeTimeout is how long to wait for an answer to each TLS hello
+	// (default 8 s).
+	HandshakeTimeout time.Duration
+}
+
 // Join enrolls with a server using a join token.
 func Join(ctx context.Context, serverURL, token, name, dataDir string) (*Identity, error) {
-	u, err := url.Parse(serverURL)
+	return JoinWith(ctx, JoinOptions{URL: serverURL, Token: token, Name: name, DataDir: dataDir})
+}
+
+// JoinWith enrolls with a server. Before sending anything it checks which
+// TLS profile the path lets through, so a firewall that silently drops one
+// kind of TLS hello doesn't leave the join hanging, and every failure says
+// at which stage it stopped.
+func JoinWith(ctx context.Context, o JoinOptions) (*Identity, error) {
+	u, err := url.Parse(o.URL)
 	if err != nil || u.Scheme != "https" || u.Host == "" {
 		return nil, errors.New("the server URL must look like https://server:7443")
 	}
 	if u.Port() == "" {
 		u.Host = net.JoinHostPort(u.Hostname(), strconv.Itoa(config.DefaultControlPort))
 	}
-	caPrefix, _, err := pki.ParseJoinToken(token)
+	caPrefix, _, err := pki.ParseJoinToken(o.Token)
 	if err != nil {
 		return nil, err
 	}
+	name := o.Name
 	if name == "" {
 		name, _ = os.Hostname()
 	}
+	debugf := func(format string, a ...any) {
+		if o.Debug != nil {
+			fmt.Fprintf(o.Debug, format+"\n", a...)
+		}
+	}
+	profiles := []string{o.TLSProfile}
+	auto := o.TLSProfile == "" || o.TLSProfile == tlsprofile.Auto
+	if auto {
+		profiles = tlsprofile.Names()
+	} else if _, err := tlsprofile.Get(o.TLSProfile); err != nil {
+		return nil, err
+	}
+	base := &tls.Config{
+		InsecureSkipVerify:     true, //nolint:gosec // verified by VerifyConnection against the CA pinned by the token
+		VerifyConnection:       pki.PinnedVerifier(caPrefix),
+		SessionTicketsDisabled: true,
+		MinVersion:             tls.VersionTLS12,
+	}
+	// Find a TLS profile that gets an answer (no secrets are sent yet).
+	chosen := ""
+	var stalled []string
+	for _, p := range profiles {
+		r, conn := tlsprofile.Probe(ctx, u.Host, p, base, cmp.Or(o.HandshakeTimeout, 8*time.Second))
+		if conn != nil {
+			_ = conn.Close()
+		}
+		if r.Stage == tlsprofile.StageConnect {
+			debugf("TCP connect to %s: %v", u.Host, r.Err)
+			return nil, fmt.Errorf("could not connect to %s: %w (check the address, that the server is running, and firewalls for TCP port %s)", u.Host, r.Err, u.Port())
+		}
+		debugf("TCP connect to %s: ok in %.1f ms; TLS profile %q: %s", u.Host, float64(r.Connect.Microseconds())/1000, p, r.Summary())
+		if r.OK() {
+			chosen = p
+			break
+		}
+		if !r.Stalled {
+			// A real TLS failure (for example a certificate that doesn't
+			// match the token's CA pin): another profile won't help.
+			return nil, fmt.Errorf("TLS with %s failed: %w", u.Host, r.Err)
+		}
+		stalled = append(stalled, p)
+	}
+	if chosen == "" {
+		return nil, fmt.Errorf("connected to %s, but the server never answered the TLS hello (TLS profiles tried: %s). "+
+			"Something on the path, such as a firewall, IPS or endpoint-security product, is probably dropping it. "+
+			"Run 'pathgauge agent diagnose %s' for details; peer mode (pathgauge endpoint / pathgauge test) doesn't use TLS and may still work",
+			u.Host, strings.Join(stalled, ", "), u.String())
+	}
+	if len(stalled) > 0 {
+		debugf("using TLS profile %q (the server never answered %s)", chosen, strings.Join(stalled, ", "))
+	}
+	cfg := base.Clone()
+	_ = tlsprofile.Apply(chosen, cfg)
+
 	keyPEM, csrPEM, err := pki.NewKeyAndCSR(name)
 	if err != nil {
 		return nil, err
 	}
 	host := hostinfo.Collect(hostinfo.SystemSources())
 	hostJSON, _ := json.Marshal(host)
-	body, _ := json.Marshal(agentproto.EnrollRequest{Token: token, Name: name, CSR: string(csrPEM), Version: version.Get().Version, Host: hostJSON})
-	client := &http.Client{Timeout: 30 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{
-		InsecureSkipVerify:     true, //nolint:gosec // verified by VerifyConnection against the CA pinned by the token
-		VerifyConnection:       pki.PinnedVerifier(caPrefix),
-		SessionTicketsDisabled: true,
-		MinVersion:             tls.VersionTLS12,
-	}}}
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, u.String()+"/api/agent/enroll", bytes.NewReader(body))
+	body, _ := json.Marshal(agentproto.EnrollRequest{Token: o.Token, Name: name, CSR: string(csrPEM), Version: version.Get().Version, Host: hostJSON})
+	var wrote, answered bool
+	start := time.Now()
+	trace := &httptrace.ClientTrace{
+		WroteRequest: func(httptrace.WroteRequestInfo) {
+			wrote = true
+			debugf("enrolment request sent (%d bytes) after %.1f ms", len(body), float64(time.Since(start).Microseconds())/1000)
+		},
+		GotFirstResponseByte: func() {
+			answered = true
+			debugf("server answered after %.1f ms", float64(time.Since(start).Microseconds())/1000)
+		},
+	}
+	client := &http.Client{Timeout: 30 * time.Second, Transport: &http.Transport{TLSClientConfig: cfg}}
+	req, _ := http.NewRequestWithContext(httptrace.WithClientTrace(ctx, trace), http.MethodPost, u.String()+"/api/agent/enroll", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := client.Do(req)
 	if err != nil {
+		switch {
+		case !wrote:
+			return nil, fmt.Errorf("enroll with %s: sending the request failed: %w", u.Host, err)
+		case !answered:
+			return nil, fmt.Errorf("enroll with %s: the request was sent but the server never answered (%w). "+
+				"Check the server's log (journalctl -u pathgauge-server); if the server is fine, run 'pathgauge agent diagnose %s'", u.Host, err, u.String())
+		}
 		return nil, fmt.Errorf("enroll with %s: %w", u.Host, err)
 	}
 	defer resp.Body.Close()
@@ -108,18 +205,21 @@ func Join(ctx context.Context, serverURL, token, name, dataDir string) (*Identit
 	if err := json.Unmarshal(rb, &er); err != nil {
 		return nil, err
 	}
-	dir := identityDir(dataDir)
+	dir := identityDir(o.DataDir)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
 	id := &Identity{AgentID: er.AgentID, Name: name, ServerURL: u.String(), DataKey: er.DataKey}
+	if chosen != "default" {
+		id.TLSProfile = chosen
+	}
 	ib, _ := json.MarshalIndent(id, "", "  ")
 	for name, data := range map[string][]byte{"identity.json": ib, "agent.key": keyPEM, "agent.crt": []byte(er.Cert), "ca.crt": []byte(er.CA)} {
 		if err := os.WriteFile(filepath.Join(dir, name), data, 0o600); err != nil {
 			return nil, err
 		}
 	}
-	chownToService(dataDir, dir)
+	chownToService(o.DataDir, dir)
 	return id, nil
 }
 
@@ -200,6 +300,10 @@ func New(cfg config.Agent, policy config.Policy, log *slog.Logger) (*Agent, erro
 		InsecureSkipVerify:     true, //nolint:gosec // verified by VerifyConnection against the pinned CA
 		VerifyConnection:       pki.ChainVerifier(pool),
 		SessionTicketsDisabled: true,
+	}
+	// Open connections the way enrolment found works on this path.
+	if err := tlsprofile.Apply(id.TLSProfile, a.tlsCfg); err != nil {
+		return nil, err
 	}
 	if policy.Shaping != config.ShapingNone {
 		a.shaper = shaping.NewTuner(log, "")

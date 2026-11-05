@@ -21,8 +21,8 @@ StateDirectoryMode=0750
 # Only the network capabilities testing needs; the service never runs as root.
 #   CAP_NET_RAW:   ICMP probes, TCP-SYN traceroute, packet capture
 #   CAP_NET_ADMIN: tc shaping (inherited by /usr/sbin/tc), SO_MARK, forced socket buffers
-AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
-CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 
 # Sandboxing. Notes:
 #   - No ProtectClock: it blocks the read-only adjtimex call used to check

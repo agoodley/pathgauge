@@ -43,7 +43,10 @@ for role in server agent; do
     user=$(ps -o user= -p "$pid" | tr -d ' ')
     [ "$user" = pathgauge ] || fail "$unit runs as '$user', want pathgauge"
     capeff=$(awk '/^CapEff/ {print $2}' "/proc/$pid/status")
-    [ "$capeff" = 0000000000003000 ] || fail "$unit CapEff=$capeff, want 0000000000003000 (NET_ADMIN+NET_RAW)"
+    # NET_ADMIN+NET_RAW; the server may also bind ports below 1024 (443).
+    want=0000000000003000
+    [ "$role" = server ] && want=0000000000003400
+    [ "$capeff" = "$want" ] || fail "$unit CapEff=$capeff, want $want"
     journalctl --no-pager -u "$unit" | grep -q "$role starting" || fail "$unit did not log its start-up"
     echo "$unit: active, user=$user, CapEff=$capeff"
 done
@@ -55,4 +58,4 @@ for role in agent server; do
     result=$(systemctl show -p Result --value "pathgauge-$role.service")
     [ "$result" = success ] || fail "pathgauge-$role did not stop cleanly (result: $result)"
 done
-echo "PASS: services start, run unprivileged with CAP_NET_ADMIN+CAP_NET_RAW, and stop cleanly"
+echo "PASS: services start, run unprivileged with only the intended capabilities, and stop cleanly"

@@ -113,6 +113,8 @@ sudo pathgauge server join-token --url https://boxA.example.com:7443
 sudo pathgauge agent join https://boxA.example.com:7443 --token pgjoin_... --name branch-office --enable
 ```
 
+Add `--debug` to see each step (TCP, TLS, request, answer). If the join hangs, see [Troubleshooting](#10-troubleshooting): `pathgauge agent diagnose https://SERVER:7443` shows where the connection stops.
+
 The token is single-use and expires (default 24 hours). It also carries a fingerprint of the server's CA, so the agent refuses to enrol with anything else, even if someone intercepts the connection. After joining:
 
 - the agent connects to the server with mutual TLS
@@ -281,7 +283,8 @@ Limits to keep in mind:
 | `pathgauge server join-token [--hours H]` | Create an agent enrolment token |
 | `pathgauge server reset-password USER` | Reset a password |
 | `pathgauge server run` | Run the server (used by the systemd unit) |
-| `pathgauge agent join URL --token T [--name N] [--enable]` | Enrol an agent |
+| `pathgauge agent join URL --token T [--name N] [--enable] [--tls-profile P] [--debug]` | Enrol an agent (`--debug` prints each connection step) |
+| `pathgauge agent diagnose URL` | Check the path to a server step by step, without enrolling |
 | `pathgauge agent status` | Show enrolment and policy |
 | `pathgauge agent run` | Run the agent (used by the systemd unit) |
 
@@ -289,6 +292,14 @@ Limits to keep in mind:
 
 ## 10. Troubleshooting
 
+- **`agent join` hangs or says the server never answered the TLS hello:** the TCP connection opens, but something on the path (a firewall, IPS or endpoint-security product on either host) silently drops the TLS hello. Such devices often log nothing, especially for traffic hitting a default-deny rule. Run `pathgauge agent diagnose https://SERVER:7443`: it tries each TLS profile and says which get through. `agent join` (with the default `--tls-profile auto`) also tries them in turn and remembers the one that works, and the agent service then uses it. Every profile is encrypted and verified the same way; they differ only in how the connection opens:
+  - `default`: TLS 1.3 with post-quantum key exchange (Go's defaults; a larger hello)
+  - `classic`: TLS 1.3 with classic key exchange only
+  - `browser`: TLS 1.3 shaped like a typical HTTPS client (ALPN, session tickets)
+  - `tls12`: TLS 1.2 only
+
+  If no profile gets through, ask for an exception (TCP 7443, and TCP and UDP 7400) or use peer mode (`pathgauge endpoint` / `pathgauge test`), whose test traffic isn't TLS.
+- **Running the server on port 443:** some networks only let 443 through. Set `listen: ":443"` in `/etc/pathgauge/server.yaml`, allow it (`sudo firewall-cmd --permanent --add-service=https && sudo firewall-cmd --reload`), restart the service, and join agents with `https://SERVER:443`. The service may bind it without root (it has `CAP_NET_BIND_SERVICE`). Port 443 is often inspected more closely than other ports, so it doesn't always help.
 - **`connect to endpoint … refused or timed out`:** open 7400/tcp **and** 7400/udp on the endpoint or server (host firewall and any cloud firewall).
 - **Agent shows offline:** check `journalctl -u pathgauge-agent`. A message about a revoked agent means it was removed in the dashboard; enrol it again with a new token.
 - **Browser certificate warning:** trust `https://SERVER:7443/ca.crt`, or click through. The certificate covers the server's hostname and IP addresses (add names under `names:` in `server.yaml`).

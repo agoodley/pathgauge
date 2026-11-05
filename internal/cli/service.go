@@ -17,6 +17,7 @@ import (
 	"github.com/agoodley/pathgauge/internal/config"
 	"github.com/agoodley/pathgauge/internal/logging"
 	"github.com/agoodley/pathgauge/internal/server"
+	"github.com/agoodley/pathgauge/internal/tlsprofile"
 	"github.com/agoodley/pathgauge/internal/version"
 )
 
@@ -232,8 +233,8 @@ func newAgentCmd() *cobra.Command {
 	}
 	run.Flags().BoolVar(&checkOnly, "check-config", false, "validate the configuration and policy, then exit")
 
-	var token, name string
-	var enable bool
+	var token, name, tlsProfile string
+	var enable, debug bool
 	join := &cobra.Command{
 		Use:   "join https://SERVER:7443 --token TOKEN",
 		Short: "Enrol this machine as an agent of a PathGauge server",
@@ -249,13 +250,23 @@ func newAgentCmd() *cobra.Command {
 			if name == "" {
 				name = cfg.Name
 			}
-			ctx, cancel := context.WithTimeout(cmd.Context(), time.Minute)
+			ctx, cancel := context.WithTimeout(cmd.Context(), 2*time.Minute)
 			defer cancel()
-			id, err := agent.Join(ctx, args[0], token, name, cfg.DataDir)
+			o := agent.JoinOptions{URL: args[0], Token: token, Name: name, DataDir: cfg.DataDir, TLSProfile: tlsProfile}
+			if debug {
+				o.Debug = cmd.ErrOrStderr()
+			}
+			id, err := agent.JoinWith(ctx, o)
 			if err != nil {
 				return err
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "Enrolled as %q (%s) with %s.\n", id.Name, id.AgentID, id.ServerURL)
+			switch {
+			case id.TLSProfile != "" && tlsProfile == tlsprofile.Auto:
+				fmt.Fprintf(cmd.OutOrStdout(), "Using TLS profile %q (the default TLS hello got no answer on this path); the agent service will use it too.\n", id.TLSProfile)
+			case id.TLSProfile != "":
+				fmt.Fprintf(cmd.OutOrStdout(), "Using TLS profile %q; the agent service will use it too.\n", id.TLSProfile)
+			}
 			if enable {
 				if err := systemctl("enable", "--now", "pathgauge-agent.service"); err != nil {
 					return err
@@ -270,6 +281,28 @@ func newAgentCmd() *cobra.Command {
 	join.Flags().StringVar(&token, "token", "", "join token from the server")
 	join.Flags().StringVar(&name, "name", "", "agent name shown in the dashboard (default: hostname)")
 	join.Flags().BoolVar(&enable, "enable", false, "enable and start pathgauge-agent.service after joining")
+	join.Flags().StringVar(&tlsProfile, "tls-profile", tlsprofile.Auto, "how to open TLS connections: auto (try each until one gets an answer), "+strings.Join(tlsprofile.Names(), ", "))
+	join.Flags().BoolVar(&debug, "debug", false, "print each step of the connection (TCP, TLS, request, answer)")
+
+	var dataPort int
+	diagnose := &cobra.Command{
+		Use:   "diagnose https://SERVER:7443",
+		Short: "Check the path to a server step by step: TCP, each TLS profile, HTTPS and the test-traffic port",
+		Long: `Check the path to a PathGauge server step by step, without enrolling and
+without sending any secret: name resolution, the TCP connection, a TLS
+handshake with each TLS profile, an HTTPS request, and the test-traffic port.
+
+Use it when 'pathgauge agent join' fails or hangs. Some firewalls, IPSs and
+endpoint-security products silently drop TLS hellos they don't recognise;
+this shows which TLS profiles get through.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx, cancel := context.WithTimeout(cmd.Context(), 2*time.Minute)
+			defer cancel()
+			return agent.Diagnose(ctx, cmd.OutOrStdout(), args[0], dataPort)
+		},
+	}
+	diagnose.Flags().IntVar(&dataPort, "data-port", config.DefaultDataPort, "the server's test-traffic port (0 to skip)")
 
 	status := &cobra.Command{
 		Use:   "status",
@@ -289,7 +322,7 @@ func newAgentCmd() *cobra.Command {
 			return nil
 		},
 	}
-	cmd.AddCommand(run, join, status)
+	cmd.AddCommand(run, join, status, diagnose)
 	return cmd
 }
 

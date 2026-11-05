@@ -11,7 +11,7 @@ This is a volunteer project. We aim to acknowledge reports within 7 days and to 
 ## Especially in scope
 
 - Generating or reflecting traffic without valid session authentication, or amplification (a reply larger than the request).
-- Escaping the service sandbox, or gaining privileges beyond `CAP_NET_RAW` and `CAP_NET_ADMIN`.
+- Escaping the service sandbox, or gaining privileges beyond `CAP_NET_RAW` and `CAP_NET_ADMIN` (plus `CAP_NET_BIND_SERVICE` for the server, so it can listen on port 443).
 - Shaping or other network changes that survive their lease, a service stop or a restart.
 - Agent enrollment, certificate or control-channel weaknesses.
 - Dashboard and API issues: authentication, authorisation, XSS, CSRF, injection.
