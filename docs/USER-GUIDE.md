@@ -113,7 +113,7 @@ sudo pathgauge server join-token --url https://boxA.example.com:7443
 sudo pathgauge agent join https://boxA.example.com:7443 --token pgjoin_... --name branch-office --enable
 ```
 
-Add `--debug` to see each step (TCP, TLS, request, answer). If the join hangs, see [Troubleshooting](#10-troubleshooting): `pathgauge agent diagnose https://SERVER:7443` shows where the connection stops.
+Add `--debug` to see each step (TCP, TLS, request, answer). If the join hangs, see [Troubleshooting](#12-troubleshooting): `pathgauge agent diagnose https://SERVER:7443` shows where the connection stops.
 
 The token is single-use and expires (default 24 hours). It also carries a fingerprint of the server's CA, so the agent refuses to enrol with anything else, even if someone intercepts the connection. After joining:
 
@@ -255,7 +255,60 @@ Limits to keep in mind:
 
 ---
 
-## 8. Monitoring, alerts and schedules
+## 8. CDP replication (Veeam CDP and similar)
+
+The `cdp-up` and `cdp-down` tests answer "will continuous replication between these sites keep its RPO, and what will it do to everything else?". They simulate continuous data protection replication such as Veeam CDP: virtual machines' changed data is produced at a steady rate with periodic write bursts and sent to the other site as fast as the path allows, over several TCP connections. The test measures the **lag**, the age of the oldest change not yet sent, which is the RPO the replica would have had at that moment. It also measures what replication does to latency for other traffic.
+
+- `cdp-up`: this host (the agent, or the `pathgauge test` side) is the CDP source.
+- `cdp-down`: the other host is the source.
+
+```bash
+pathgauge test boxA --key pg_... --cdp-rate 40 --cdp-rpo 15 --cdp-duration 300
+pathgauge test boxA --key pg_... --tests cdp-down --cdp-rate 40 --cdp-limit 50   # with a throttle
+```
+
+| Option | Meaning | Default |
+|---|---|---|
+| `--cdp-rate` | Average changed data **on the wire**, Mbit/s (after Veeam's compression; 1 MB/s = 8 Mbit/s) | half the measured TCP rate |
+| `--cdp-burst` | Write bursts as a multiple of the average | 3 |
+| `--cdp-burst-secs`, `--cdp-period` | Burst length, and the time from one burst to the next | 10 s, 60 s |
+| `--cdp-limit` | Throttle replication to this rate, like a Veeam network traffic rule | none |
+| `--cdp-streams` | TCP connections | 4 |
+| `--cdp-rpo` | The RPO to check against (Veeam's default is 15 s) | 15 s |
+| `--cdp-duration` | How long to replicate | 60 s × `--scale` |
+
+For a sizing answer, use the change rate your VMs really produce (Veeam's CDP policy wizard estimates it from their I/O history), run for several burst periods (for example `--cdp-duration 300`), and repeat with `--cdp-limit` at the throttle you plan to use. On the dashboard, the same settings are on the New run page.
+
+Verdicts: **good** when the worst lag stays under half the RPO, **acceptable** when it stays within the RPO, **poor** when it goes over. Findings say how long the RPO was missed, what the path carried while changes waited, and whether replication pushed up latency for other traffic (with throttle and queue-management advice).
+
+Limits to keep in mind:
+
+- It reproduces CDP's traffic pattern (continuous changes, bursts, several TCP streams, random incompressible data), not Veeam's protocol. Equipment that identifies applications won't see it as Veeam.
+- It runs on PathGauge's ports. Veeam's own CDP ports (Veeam documents TCP 33032 and 33033 between CDP proxies for Cloud Connect; check the "Used ports" page for your version) may be treated differently by firewalls or QoS. To test on a specific port, run `pathgauge endpoint --listen :33033` on the target and `pathgauge test target:33033 …` from the source.
+- The rate is what crosses the network. If you know the change rate before compression, divide it by your expected compression ratio.
+
+---
+
+## 9. Running tests together (under load)
+
+Tests normally run one at a time, so each measures the path on its own. To see what happens under load, run some of them **together as a group**: they start at the same time and each runs for the group duration. By default each test in the group first runs **on its own** for the same time, and the report compares the two, for example "voice call quality 4.4 alone, 3.1 together".
+
+```bash
+pathgauge test boxA --key pg_... --together voip,cdp-up,tcp-down             # alone, then together
+pathgauge test boxA --key pg_... --together latency,mix --group-duration 60
+pathgauge test boxA --key pg_... --tests info,latency+voip+cdp-up --no-baseline  # together only
+```
+
+On the dashboard, New run has a "Run together" section. In the API and the test list, a group is tests joined with `+` (`voip+cdp-up+tcp-down`).
+
+- **Duration.** Each test in a group runs for `--group-duration` seconds (default 30 × `--scale`, at least 15). Tests with several phases share that time between them: a rate sweep's ten steps get a tenth each, bufferbloat's idle and loaded phases share it, and the traffic mix's two phases get half each (at least 10 s). TCP phases still last at least 40 round trips on long paths.
+- **What's compared.** Each test's key results: round trip and loss (latency), worst MOS (voice), throughput (TCP), loss and jitter (UDP), worst lag and time within the RPO (CDP), share of good sessions (traffic mix), page-load time (short transfers). A result counts as worse when it changes by more than ordinary run-to-run variation (for example MOS down by 0.3, round trip up by over 20 ms and 50%, throughput down by 30%).
+- **The rest of the report is unaffected.** Results measured together are kept out of the normal findings and the health score, so an idle-latency finding never comes from a step that ran under load.
+- `sqm` and the capacity searches can't run in a group: they change shaping or run their own loads.
+
+---
+
+## 10. Monitoring, alerts and schedules
 
 - **Monitoring:** each agent sends a latency, jitter and loss sample to the server every minute. You can change the interval per agent or turn it off. Monitoring pauses while a test runs. Samples are kept for 90 days (`retention_days` in `server.yaml`).
 - **Alert metrics:**
@@ -269,7 +322,7 @@ Limits to keep in mind:
 
 ---
 
-## 9. Command reference
+## 11. Command reference
 
 | Command | Purpose |
 |---|---|
@@ -290,7 +343,7 @@ Limits to keep in mind:
 
 ---
 
-## 10. Troubleshooting
+## 12. Troubleshooting
 
 - **`agent join` hangs or says the server never answered the TLS hello:** the TCP connection opens, but something on the path (a firewall, IPS or endpoint-security product on either host) silently drops the TLS hello. Such devices often log nothing, especially for traffic hitting a default-deny rule. Run `pathgauge agent diagnose https://SERVER:7443`: it tries each TLS profile and says which get through. `agent join` (with the default `--tls-profile auto`) also tries them in turn and remembers the one that works, and the agent service then uses it. Every profile is encrypted and verified the same way; they differ only in how the connection opens:
   - `default`: TLS 1.3 with post-quantum key exchange (Go's defaults; a larger hello)

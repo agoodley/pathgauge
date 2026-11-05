@@ -75,6 +75,16 @@ func SetPacingRate(c syscall.Conn, bytesPerSec uint64) error {
 	})
 }
 
+// SetNotSentLowat limits how much unsent data the kernel holds for a TCP
+// socket (TCP_NOTSENT_LOWAT), without limiting the data in flight. Writers
+// then wait in the application instead of the socket buffer, so the
+// application knows how far behind it is.
+func SetNotSentLowat(c syscall.Conn, bytes int) error {
+	return control(c, func(fd int) error {
+		return unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_NOTSENT_LOWAT, bytes)
+	})
+}
+
 // SetBuffers sets send and receive buffer sizes. With force it uses the
 // *FORCE variants (needs CAP_NET_ADMIN) and falls back silently.
 func SetBuffers(c syscall.Conn, size int) {

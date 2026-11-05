@@ -45,7 +45,13 @@ export function GradeBadge({ grade }: { grade: string }) {
 }
 
 export function profileLabel(r: Pick<Run, 'profile' | 'options'>): string {
-  if (r.profile === 'custom' && r.options?.tests?.length) return `custom (${r.options.tests.length} tests)`;
+  const tests = r.options?.tests ?? [];
+  if (r.profile === 'custom' && tests.length) {
+    // "a+b" entries are groups: count their tests too.
+    const groups = tests.filter((t) => t.includes('+')).length;
+    const n = tests.reduce((a, t) => a + t.split('+').length, 0);
+    return `custom (${n} tests${groups ? `, ${groups} ${groups === 1 ? 'group' : 'groups'}` : ''})`;
+  }
   return r.profile ? cap(r.profile) : '—';
 }
 

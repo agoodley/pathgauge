@@ -28,6 +28,10 @@ type TCPParams struct {
 	Compressible bool
 	// OnInterval receives live throughput (Mbit/s) for progress displays.
 	OnInterval func(dir results.Direction, t, mbps float64)
+	// CDP, if set, sends simulated CDP replication (changed data with
+	// bursts) instead of bulk data; CDPLimitBps caps it like a throttle.
+	CDP         *flow.CDPModel
+	CDPLimitBps float64
 }
 
 func (p *TCPParams) defaults() {
@@ -55,6 +59,7 @@ type tcpRun struct {
 	wg      sync.WaitGroup
 	sampled chan struct{}
 	started time.Time
+	cdp     *flow.CDPResult
 }
 
 // startTCP begins a TCP test and returns without waiting for it.
@@ -68,6 +73,7 @@ func startTCP(ctx context.Context, c *Client, p TCPParams) (*tcpRun, error) {
 	err := c.Call(ctx, "tcp_prepare", endpoint.TCPPrepare{
 		Role: role, Streams: p.Streams, DurationMs: int(p.Duration / time.Millisecond), IntervalMs: int(p.Interval / time.Millisecond),
 		Congestion: congestionFor(p, results.Down), PacingBps: pacingFor(p, results.Down), BufferBytes: p.BufferBytes, Compressible: p.Compressible,
+		CDP: cdpFor(p, results.Down), CDPLimitBps: p.CDPLimitBps,
 	}, &r.prep)
 	if err != nil {
 		return nil, err
@@ -135,6 +141,22 @@ func startTCP(ctx context.Context, c *Client, p TCPParams) (*tcpRun, error) {
 		r.sampler.Run(runCtx, r.streams, onSample)
 		close(r.sampled)
 	}()
+	if p.Direction == results.Up && p.CDP != nil {
+		r.wg.Add(1)
+		go func() {
+			defer r.wg.Done()
+			res := flow.SendCDP(runCtx, r.streams, *p.CDP, p.CDPLimitBps, p.Duration)
+			r.cdp = &res
+			for _, s := range r.streams {
+				_ = s.Conn.CloseWrite()
+			}
+		}()
+		go func() {
+			r.wg.Wait()
+			cancel()
+		}()
+		return r, nil
+	}
 	for _, s := range r.streams {
 		r.wg.Add(1)
 		go func(s *flow.Stream) {
@@ -152,6 +174,13 @@ func startTCP(ctx context.Context, c *Client, p TCPParams) (*tcpRun, error) {
 		cancel()
 	}()
 	return r, nil
+}
+
+func cdpFor(p TCPParams, sender results.Direction) *flow.CDPModel {
+	if p.Direction == sender {
+		return p.CDP
+	}
+	return nil
 }
 
 func congestionFor(p TCPParams, sender results.Direction) string {
@@ -184,6 +213,9 @@ func (r *tcpRun) wait(ctx context.Context) (*results.TCP, error) {
 	}
 	var er endpoint.TCPResult
 	err := r.c.Call(ctx, "tcp_result", map[string]any{"test_id": r.prep.TestID, "wait_ms": int((r.p.Duration + 30*time.Second) / time.Millisecond)}, &er)
+	if er.CDP != nil {
+		r.cdp = er.CDP
+	}
 	for _, s := range r.streams {
 		s.Conn.Close()
 	}

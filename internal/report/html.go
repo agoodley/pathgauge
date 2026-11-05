@@ -48,6 +48,7 @@ func WriteHTML(w io.Writer, r *results.Report, o Options) error {
 		"Findings": r.Findings,
 		"FP":       fingerprintRows(r),
 		"Sections": sections,
+		"Load":     loadSection(r),
 		"Method":   methodology(r),
 		"CSS":      template.CSS(css),
 		"JS":       template.JS(js),
@@ -203,6 +204,7 @@ var page = template.Must(template.New("page").Funcs(template.FuncMap{"sevIcon": 
 <section><h2>Findings</h2>
 {{range .Findings}}<article class="finding {{.Severity}}"><p class="sev">{{sevIcon .Severity}}</p><div><h3>{{.Title}}</h3><p>{{.Detail}}</p>{{if .Recommendation}}<p class="rec"><b>Recommendation:</b> {{.Recommendation}}</p>{{end}}{{if .Evidence}}<p class="evidence">Evidence: {{range .Evidence}}<a href="#{{.}}">{{.}}</a> {{end}}</p>{{end}}</div></article>{{end}}
 </section>
+{{.Load}}
 <section class="two"><div><h2>Link fingerprint</h2><table>{{range .FP}}<tr><th>{{index . 0}}</th><td>{{index . 1}}</td></tr>{{end}}</table></div>
 <div><h2>Score breakdown</h2><table>{{range .Parts}}<tr><th>{{index . 0}}</th><td>{{index . 1}}</td></tr>{{end}}</table></div></section>
 {{if not .Exec}}<h2>Results</h2>{{range .Sections}}{{.}}{{end}}{{end}}
@@ -213,7 +215,7 @@ var page = template.Must(template.New("page").Funcs(template.FuncMap{"sevIcon": 
 // section renders one step.
 func section(r *results.Report, s results.Step) template.HTML {
 	var b strings.Builder
-	fmt.Fprintf(&b, `<section class="step" id="%s"><h3>%s <small class="muted">%s · %.1f s</small></h3>`, html.EscapeString(s.ID), html.EscapeString(s.Title), html.EscapeString(s.ID), s.Seconds)
+	fmt.Fprintf(&b, `<section class="step" id="%s"><h3>%s%s <small class="muted">%s · %.1f s</small></h3>`, html.EscapeString(s.ID), html.EscapeString(s.Title), html.EscapeString(phaseLabel(r, s)), html.EscapeString(s.ID), s.Seconds)
 	if s.Status != "ok" {
 		fmt.Fprintf(&b, `<p class="err">%s: %s</p></section>`, html.EscapeString(s.Status), html.EscapeString(s.Error))
 		return template.HTML(b.String())
@@ -291,6 +293,8 @@ func section(r *results.Report, s results.Step) template.HTML {
 		mixSection(&b, v)
 	case *results.Capacity:
 		capacitySection(&b, v)
+	case *results.CDP:
+		cdpSection(&b, v, s.ID)
 	case *results.QoS:
 		var rows [][]string
 		var cats []string

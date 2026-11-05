@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"math"
 	"sync"
 	"time"
 
@@ -34,11 +35,14 @@ func RunVoIP(ctx context.Context, c *Client, vp VoIPParams) (*results.VoIP, erro
 	res := &results.VoIP{Codec: "G.711 (20 ms)", DurationS: vp.Duration.Seconds(), Loaded: vp.Load}
 
 	var ready endpoint.UDPSinkReady
-	if err := c.Call(ctx, "udp_sink", endpoint.UDPSinkReq{}, &ready); err != nil {
+	// Per-packet logs let the receiver's adaptive jitter buffer be
+	// simulated (older endpoints ignore the request).
+	if err := c.Call(ctx, "udp_sink", endpoint.UDPSinkReq{Log: true}, &ready); err != nil {
 		return nil, err
 	}
 	downStream := c.LocalStream()
 	downSink := flow.NewUDPSink(0)
+	downSink.EnableLog()
 	c.AddSink(downStream, downSink)
 	defer c.AddSink(downStream, nil)
 	c.punch()
@@ -101,8 +105,16 @@ func RunVoIP(ctx context.Context, c *Client, vp VoIPParams) (*results.VoIP, erro
 	p.mu.Unlock()
 	rtt := stats.Summarize(rtts)
 	res.OneWayMs = stats.Round(rtt.Median/2, 2)
-	res.Up = voipDir(upSink, res.OneWayMs, vp.JitterBufferMs)
-	res.Down = voipDir(down, res.OneWayMs, vp.JitterBufferMs)
+	// With packet logs, grade the call through an adaptive jitter buffer
+	// (as real phones work): a steady queue becomes delay, not lost audio.
+	// The idle one-way delay is half the smallest round trip.
+	res.Up, res.Down = voipDir(upSink, res.OneWayMs, vp.JitterBufferMs), voipDir(down, res.OneWayMs, vp.JitterBufferMs)
+	if d, ok := voipDirAdaptive(upSink, rtt.Min/2); ok {
+		res.Up = d
+	}
+	if d, ok := voipDirAdaptive(down, rtt.Min/2); ok {
+		res.Down = d
+	}
 	res.Verdict = worseVerdict(res.Up.Verdict, res.Down.Verdict)
 	return res, nil
 }
@@ -124,6 +136,20 @@ func voipDir(s flow.SinkResult, oneWayMs float64, jb int) results.VoIPDir {
 	d.MOS, d.R = stats.Round(mos, 2), stats.Round(r, 1)
 	d.Verdict = mosVerdict(d.MOS)
 	return d
+}
+
+// voipDirAdaptive grades one direction through the adaptive jitter buffer
+// used for simulated calls; ok is false without a packet log.
+func voipDirAdaptive(s flow.SinkResult, baseOneWay float64) (results.VoIPDir, bool) {
+	if s.Packets == nil || s.OWDRaw.N == 0 {
+		return results.VoIPDir{}, false
+	}
+	po := flow.VoicePlayout.PlayoutLog(s.Packets)
+	late := po.LatePct * (100 - s.Loss.LossPct) / 100
+	playout := math.Max(0, po.MeanTarget-s.OWDRaw.Min)
+	mos, r := stats.MOS(baseOneWay+playout+20, s.JitterMs, s.Loss.LossPct+late)
+	return results.VoIPDir{Loss: s.Loss, JitterMs: stats.Round(s.JitterMs, 2), LateLossPct: stats.Round(late, 2), PlayoutMs: stats.Round(playout, 1),
+		MOS: stats.Round(mos, 2), R: stats.Round(r, 1), Verdict: mosVerdict(mos)}, true
 }
 
 func mosVerdict(m float64) string {

@@ -5,6 +5,7 @@ package agentproto
 import (
 	"encoding/json"
 
+	"github.com/agoodley/pathgauge/internal/results"
 	"github.com/agoodley/pathgauge/internal/store"
 )
 
@@ -60,8 +61,14 @@ type RunRequest struct {
 	TraceCycles int      `json:"trace_cycles,omitempty"`
 	Mix         string   `json:"mix,omitempty"`     // traffic mix for the mix test
 	NoDSCP      bool     `json:"no_dscp,omitempty"` // send simulated calls unmarked
-	ClientName  string   `json:"client_name"`
-	ServerName  string   `json:"server_name"`
+	// CDP configures the cdp-up/cdp-down tests.
+	CDP *results.CDPSettings `json:"cdp,omitempty"`
+	// Groups ("a+b" entries in Tests): how long each grouped test runs,
+	// and whether to skip running each on its own first.
+	GroupDurationS float64 `json:"group_duration_s,omitempty"`
+	NoBaseline     bool    `json:"no_baseline,omitempty"`
+	ClientName     string  `json:"client_name"`
+	ServerName     string  `json:"server_name"`
 }
 
 // Monitor carries monitoring samples.

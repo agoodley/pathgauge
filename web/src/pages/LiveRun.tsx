@@ -1,12 +1,13 @@
-import { useEffect, useMemo, useState } from 'react';
+import { Fragment, useEffect, useMemo, useState } from 'react';
 import { api, errorMessage } from '../lib/api';
 import { useCan } from '../lib/auth';
-import { estimateSeconds, runTests } from '../lib/domain';
-import { between, fmtDuration, fmtMbps, fmtMs, fmtTime, f1, rateScale } from '../lib/format';
+import { estimateSteps, runTests } from '../lib/domain';
+import { groupDefaultDuration, planSteps } from '../lib/groups';
+import { between, fmtDuration, fmtMbps, fmtMs, fmtTime, f0, f1, rateScale } from '../lib/format';
 import { useTick } from '../lib/hooks';
 import { live, useRunEvents } from '../lib/live';
 import { Link } from '../lib/router';
-import { usePalette } from '../lib/theme';
+import { usePalette, type Palette } from '../lib/theme';
 import type { CapacityStep, EngineEvent, Run, SweepStep } from '../lib/types';
 import { Badge, Card, ConfirmButton, Empty, Notice, PageHeader, toast } from '../components/ui';
 import { Figure, lineOption, type LineSeries } from '../components/Chart';
@@ -15,27 +16,41 @@ import { SweepTable, bloatSeries, stepHeadline } from '../components/StepResult'
 import { CapacityStepsTable, capacityMetric, capacityOption, capacityOverlap, OVERLAP_NOTE, SEARCH_LABEL } from '../components/MixResult';
 
 interface StepState {
+  /** Step ID (s03-tcp-down, s04-g1-together-voip). */
+  id: string;
   index: number;
   test: string;
   title: string;
-  stepId?: string;
+  group?: string;
+  phase?: 'alone' | 'together';
   status: 'pending' | 'running' | 'ok' | 'error' | 'skipped' | 'earlier';
   seconds?: number;
   error?: string;
   headline?: string;
-  startedAt?: number;
+}
+
+/** Live throughput of one step in one direction. */
+interface ThroughputSeries {
+  step: string;
+  test: string;
+  dir: string;
+  points: [number, number][];
 }
 
 interface LiveState {
   tests: string[] | null;
-  steps: Map<number, StepState>;
-  current: StepState | null;
+  /**
+   * Steps seen so far, by step ID. While a group's tests run together
+   * several are running at once, and they share their entry's index.
+   */
+  steps: Map<string, StepState>;
   sawStart: boolean;
-  throughput: Map<string, [number, number][]>;
+  /** By step and direction: a group's steps interleave their samples. */
+  throughput: Map<string, ThroughputSeries>;
   latency: Map<string, [number, number][]>;
-  sweep: SweepStep[];
+  /** Rate sweeps by step. */
+  sweep: Map<string, SweepStep[]>;
   sqm: string[];
-  throughputStep: string;
   latencyStep: string;
   /** Traffic mix / call capacity: probe RTT by series, phases end to end. */
   sessionRtt: Map<string, [number, number | null][]>;
@@ -52,26 +67,27 @@ function derive(events: EngineEvent[]): LiveState {
   const st: LiveState = {
     tests: null,
     steps: new Map(),
-    current: null,
     sawStart: false,
     throughput: new Map(),
     latency: new Map(),
-    sweep: [],
+    sweep: new Map(),
     sqm: [],
-    throughputStep: '',
     latencyStep: '',
     sessionRtt: new Map(),
     sessionPhase: '',
     sessionTest: '',
     capacity: [],
   };
-  // Per-direction time offsets so tests that restart their clock (stream
+  // Per-series time offsets so tests that restart their clock (stream
   // scaling, bufferbloat phases) draw left to right.
   const lastT = new Map<string, number>();
   const offset = new Map<string, number>();
   // Mix and capacity phases each restart their clock at 0: lay them end to end.
   const phaseOffset = new Map<string, number>();
   let phaseEnd = 0;
+  const running = new Set<string>();
+  const keyOf = (e: EngineEvent) => e.step || `#${e.index ?? 0}`;
+  const titleOf = (e: EngineEvent) => st.steps.get(keyOf(e))?.title ?? e.title ?? e.test ?? '';
   for (const e of events) {
     switch (e.type) {
       case 'run_start':
@@ -79,60 +95,64 @@ function derive(events: EngineEvent[]): LiveState {
         if (Array.isArray(e.data)) st.tests = e.data.map(String);
         break;
       case 'step_start': {
-        const s: StepState = { index: e.index ?? st.steps.size + 1, test: e.test ?? '', title: e.title ?? e.test ?? '', stepId: e.step, status: 'running' };
-        st.steps.set(s.index, s);
-        st.current = s;
-        // New step: reset the live charts.
-        st.throughput = new Map();
-        st.latency = new Map();
-        st.sweep = [];
-        st.sqm = [];
-        st.sessionRtt = new Map();
-        st.sessionPhase = '';
-        st.sessionTest = '';
-        st.capacity = [];
-        lastT.clear();
-        offset.clear();
-        phaseOffset.clear();
-        phaseEnd = 0;
+        const id = keyOf(e);
+        // A new step resets the live charts, unless other steps are still
+        // running (a group's tests start together).
+        if (running.size === 0) {
+          st.throughput = new Map();
+          st.latency = new Map();
+          st.sweep = new Map();
+          st.sqm = [];
+          st.sessionRtt = new Map();
+          st.sessionPhase = '';
+          st.sessionTest = '';
+          st.capacity = [];
+          lastT.clear();
+          offset.clear();
+          phaseOffset.clear();
+          phaseEnd = 0;
+        }
+        running.add(id);
+        st.steps.set(id, { id, index: e.index ?? 0, test: e.test ?? '', title: e.title ?? e.test ?? '', status: 'running' });
         break;
       }
       case 'step_done': {
-        const idx = e.index ?? 0;
-        const prev = st.steps.get(idx);
+        const id = keyOf(e);
+        running.delete(id);
+        const prev = st.steps.get(id);
         const status = e.status === 'ok' ? 'ok' : e.status === 'skipped' ? 'skipped' : 'error';
         let headline = '';
         if (status === 'ok') {
           const d = Array.isArray(e.data) ? undefined : e.data;
           headline = stepHeadline(e.test ?? '', d);
         }
-        st.steps.set(idx, {
-          ...(prev ?? { index: idx, test: e.test ?? '', title: e.title ?? '' }),
+        st.steps.set(id, {
+          ...(prev ?? { id, index: e.index ?? 0, test: e.test ?? '', title: e.title ?? '' }),
           title: e.title || prev?.title || e.test || '',
           status,
           seconds: e.seconds,
           error: e.error,
           headline,
         });
-        if (st.current?.index === idx) st.current = null;
         break;
       }
       case 'progress': {
         const d = (e.data ?? {}) as Record<string, unknown>;
         const kind = d.kind;
+        const id = keyOf(e);
+        const test = e.test ?? st.steps.get(id)?.test ?? '';
         if (kind === 'throughput') {
           const dir = String(d.direction ?? 'down');
+          const key = `${id}|${dir}`;
           let t = Number(d.t);
-          const prevT = lastT.get(dir);
-          if (prevT !== undefined && t + (offset.get(dir) ?? 0) < prevT - 0.01) offset.set(dir, prevT);
-          t += offset.get(dir) ?? 0;
-          lastT.set(dir, t);
-          const arr = st.throughput.get(dir) ?? [];
-          arr.push([Math.round(t * 100) / 100, Number(d.mbps)]);
-          st.throughput.set(dir, arr);
-          st.throughputStep = st.current?.title ?? '';
-        } else if (kind === 'latency' && isSessionTest(e.test ?? st.current?.test ?? '')) {
-          const test = e.test ?? st.current?.test ?? '';
+          const prevT = lastT.get(key);
+          if (prevT !== undefined && t + (offset.get(key) ?? 0) < prevT - 0.01) offset.set(key, prevT);
+          t += offset.get(key) ?? 0;
+          lastT.set(key, t);
+          const s = st.throughput.get(key) ?? { step: id, test, dir, points: [] };
+          s.points.push([Math.round(t * 100) / 100, Number(d.mbps)]);
+          st.throughput.set(key, s);
+        } else if (kind === 'latency' && isSessionTest(test)) {
           const ph = String(d.phase ?? '');
           const rtt = Number(d.rtt_ms);
           if (!Number.isFinite(rtt)) break;
@@ -152,18 +172,20 @@ function derive(events: EngineEvent[]): LiveState {
           st.sessionRtt.set(key, arr);
           st.sessionPhase = ph;
           st.sessionTest = test;
-          st.latencyStep = st.current?.title ?? '';
+          st.latencyStep = titleOf(e);
         } else if (kind === 'capacity' && d.step && typeof d.step === 'object') {
           st.capacity.push({ ...(d.step as CapacityStep), search: String(d.search ?? 'alone') });
-          st.sessionTest = e.test ?? st.current?.test ?? st.sessionTest;
+          st.sessionTest = test || st.sessionTest;
         } else if (kind === 'latency') {
           const ph = String(d.phase ?? 'idle');
           const arr = st.latency.get(ph) ?? [];
           arr.push([Number(d.t), Number(d.rtt_ms)]);
           st.latency.set(ph, arr);
-          st.latencyStep = st.current?.title ?? '';
+          st.latencyStep = titleOf(e);
         } else if (kind === 'sweep' && d.step && typeof d.step === 'object') {
-          st.sweep.push(d.step as SweepStep);
+          const arr = st.sweep.get(id) ?? [];
+          arr.push(d.step as SweepStep);
+          st.sweep.set(id, arr);
         } else if (kind === 'sqm' && typeof d.message === 'string') {
           st.sqm.push(d.message);
         }
@@ -184,6 +206,22 @@ const SESSION_SERIES: Record<string, [label: string, slot: number]> = {
 };
 const DIR_SLOT: Record<string, number> = { down: 0, up: 1, bidir: 2 };
 
+function sweepOption(P: Palette, list: SweepStep[]) {
+  const max = Math.max(0, ...list.map((s) => Math.max(s.offered_mbps, s.delivered_mbps)));
+  const sc = rateScale(max);
+  const off = list.map((s) => s.offered_mbps / sc.div);
+  return lineOption(P, {
+    series: [
+      { name: 'delivered', data: list.map((s, i) => [off[i], s.delivered_mbps / sc.div]), points: false },
+      { name: 'offered (ideal)', data: off.map((x) => [x, x]), slot: 2, dashed: true },
+    ],
+    xName: `offered (${sc.unit})`,
+    yName: `delivered (${sc.unit})`,
+    yFmt: (y) => fmtMbps(y * sc.div),
+    xFmt: (x) => `offered ${fmtMbps(x * sc.div)}`,
+  });
+}
+
 export function LiveRun({ run, onChange }: { run: Run; onChange: () => void }) {
   const P = usePalette();
   const profiles = useProfiles();
@@ -202,34 +240,65 @@ export function LiveRun({ run, onChange }: { run: Run; onChange: () => void }) {
 
   const st = useMemo(() => derive(events), [events, version]);
   const tests = st.tests ?? runTests(run, profiles?.profiles);
-  const total = tests.length;
-  // Steps before the first one this page saw start finished before it
-  // connected (the API has no history of live events).
-  const firstSeen = Math.min(...[...st.steps.keys()], Infinity);
-  const rows: StepState[] = tests.map(
-    (t, i) =>
-      st.steps.get(i + 1) ?? { index: i + 1, test: t, title: profiles?.titles[t] ?? t, status: i + 1 < firstSeen && firstSeen !== Infinity ? 'earlier' : 'pending' },
-  );
+  const baseline = !run.options?.no_baseline;
+  const testsKey = tests.join(',');
+  const plan = useMemo(() => planSteps(testsKey ? testsKey.split(',') : [], baseline), [testsKey, baseline]);
+  const hasGroups = plan.some((p) => p.group);
+  // One row per planned step (a group's tests on their own, then together),
+  // plus any step the plan didn't foresee. Rows before the first one this
+  // page saw finished before it connected.
+  const rows: StepState[] = useMemo(() => {
+    const firstSeen = plan.findIndex((p) => st.steps.has(p.id));
+    const out: StepState[] = plan.map((p, i) => {
+      const s = st.steps.get(p.id);
+      if (s) return { ...s, group: p.group, phase: p.phase };
+      return {
+        id: p.id,
+        index: p.index,
+        test: p.test,
+        title: profiles?.titles[p.test] ?? p.test,
+        group: p.group,
+        phase: p.phase,
+        status: firstSeen > i ? 'earlier' : 'pending',
+      };
+    });
+    for (const s of st.steps.values()) if (!plan.some((p) => p.id === s.id)) out.push(s);
+    return out;
+  }, [plan, st, profiles]);
+  const total = rows.length;
   const done = rows.filter((r) => r.status === 'ok' || r.status === 'error' || r.status === 'skipped' || r.status === 'earlier').length;
   const elapsed = between(run.started_at || run.created_at, new Date().toISOString()) ?? 0;
-  const remaining = estimateSeconds(
-    rows.filter((r) => r.status === 'pending' || r.status === 'running').map((r) => r.test),
+  const groupDur = run.options?.group_duration_s || groupDefaultDuration(run.options?.scale ?? 1);
+  const remaining = estimateSteps(
+    rows.filter((r) => r.status === 'pending' || r.status === 'running'),
     run.options?.scale ?? 1,
+    { cdpDurationS: run.options?.cdp?.duration_s, groupDurationS: run.options?.group_duration_s, baseline },
   );
+  const stepTitle = (id: string) => rows.find((r) => r.id === id)?.title ?? '';
 
-  const thrOpt = useMemo(() => {
-    const series: LineSeries[] = [...st.throughput.entries()]
-      .sort((a, b) => (DIR_SLOT[a[0]] ?? 3) - (DIR_SLOT[b[0]] ?? 3))
-      .map(([dir, pts]) => ({ name: DIR_LABEL[dir] ?? dir, data: pts, slot: DIR_SLOT[dir] ?? 3 }));
+  // Throughput: one step as before (series by direction); several steps
+  // running together get a series each, named by test, colours in the
+  // order they appeared.
+  const thr = useMemo(() => {
+    const list = [...st.throughput.values()];
+    const steps = [...new Set(list.map((s) => s.step))];
+    const many = steps.length > 1;
+    const series: LineSeries[] = many
+      ? list.map((s, i) => ({ name: `${DIR_LABEL[s.dir] ?? s.dir} · ${s.test}`, data: s.points, ...(i < 4 ? { slot: i } : { color: P.muted }) }))
+      : list
+          .map((s) => ({ name: DIR_LABEL[s.dir] ?? s.dir, data: s.points as [number, number | null][], slot: DIR_SLOT[s.dir] ?? 3 }))
+          .sort((a, b) => a.slot - b.slot);
     const max = Math.max(0, ...series.flatMap((s) => s.data.map((p) => p[1] ?? 0)));
     const sc = rateScale(max);
-    return lineOption(P, {
+    const option = lineOption(P, {
       series: series.map((s) => ({ ...s, data: s.data.map(([x, y]) => [x, y === null ? null : y / sc.div] as [number, number | null]) })),
-      xName: 'seconds',
+      // Samples carry each step's own clock (no shared timestamp).
+      xName: many ? 'seconds since each test started' : 'seconds',
       yName: sc.unit,
       yFmt: (y) => fmtMbps(y * sc.div),
       xFmt: (x) => `${f1(x)} s`,
     });
+    return { option, steps, test: list[0]?.test ?? '' };
   }, [st, P]);
 
   const latOpt = useMemo(
@@ -272,21 +341,7 @@ export function LiveRun({ run, onChange }: { run: Run; onChange: () => void }) {
   );
   const capOpt = useMemo(() => capacityOption(P, capKind, capSearches), [P, capKind, capSearches]);
 
-  const sweepOpt = useMemo(() => {
-    const max = Math.max(0, ...st.sweep.map((s) => Math.max(s.offered_mbps, s.delivered_mbps)));
-    const sc = rateScale(max);
-    const off = st.sweep.map((s) => s.offered_mbps / sc.div);
-    return lineOption(P, {
-      series: [
-        { name: 'delivered', data: st.sweep.map((s, i) => [off[i], s.delivered_mbps / sc.div]), points: false },
-        { name: 'offered (ideal)', data: off.map((x) => [x, x]), slot: 2, dashed: true },
-      ],
-      xName: `offered (${sc.unit})`,
-      yName: `delivered (${sc.unit})`,
-      yFmt: (y) => fmtMbps(y * sc.div),
-      xFmt: (x) => `offered ${fmtMbps(x * sc.div)}`,
-    });
-  }, [st, P]);
+  const sweeps = useMemo(() => [...st.sweep.entries()].map(([id, list]) => ({ id, list, option: sweepOption(P, list) })), [st, P]);
 
   const cancel = async () => {
     try {
@@ -299,6 +354,9 @@ export function LiveRun({ run, onChange }: { run: Run; onChange: () => void }) {
     }
   };
 
+  const thrTitle = thr.steps.length > 1 ? `${thr.steps.length} tests together` : stepTitle(thr.steps[0] ?? '');
+  const thrCDP = thr.steps.length === 1 && thr.test.startsWith('cdp-');
+  const running = rows.filter((r) => r.status === 'running');
   const pct = total ? Math.round((100 * done) / total) : 0;
   return (
     <div className="page">
@@ -324,11 +382,19 @@ export function LiveRun({ run, onChange }: { run: Run; onChange: () => void }) {
         }
       />
       <div className="progress-wrap" aria-label="Run progress">
-        <div className="progress" role="progressbar" aria-valuemin={0} aria-valuemax={total} aria-valuenow={done} aria-valuetext={`${done} of ${total} tests done`}>
+        <div
+          className="progress"
+          role="progressbar"
+          aria-valuemin={0}
+          aria-valuemax={total}
+          aria-valuenow={done}
+          aria-valuetext={`${done} of ${total} ${hasGroups ? 'steps' : 'tests'} done`}
+        >
           <div className="progress-fill" style={{ width: `${pct}%` }} />
         </div>
         <div className="progress-text">
-          {done} of {total} tests done{total > done ? ` · about ${fmtDuration(remaining)} left` : ' · finishing…'}
+          {done} of {total} {hasGroups ? 'steps' : 'tests'} done{total > done ? ` · about ${fmtDuration(remaining)} left` : ' · finishing…'}
+          {running.length > 1 && ` · ${running.length} running together`}
         </div>
       </div>
       {!st.sawStart && events.length === 0 && (
@@ -337,31 +403,55 @@ export function LiveRun({ run, onChange }: { run: Run; onChange: () => void }) {
       <div className="live-grid">
         <Card title="Steps" className="live-steps">
           <ol className="steps">
-            {rows.map((r) => (
-              <li key={r.index} className={`step-row step-${r.status}`}>
-                <StepIcon s={r.status} />
-                <div className="step-main">
-                  <div className="step-title">{r.title}</div>
-                  <div className="cell-sub">
-                    {r.status === 'running' && 'running…'}
-                    {r.status === 'ok' && `${r.seconds ? `${f1(r.seconds)} s` : '<0.1 s'}${r.headline ? ' · ' + r.headline : ''}`}
-                    {r.status === 'error' && <span className="text-critical">{r.error || 'failed'}</span>}
-                    {r.status === 'skipped' && 'skipped'}
-                    {r.status === 'earlier' && 'finished before this page opened'}
-                    {r.status === 'pending' && <code className="small">{r.test}</code>}
+            {rows.map((r, i) => (
+              <Fragment key={r.id}>
+                {r.group && (rows[i - 1]?.group !== r.group || rows[i - 1]?.phase !== r.phase) && (
+                  <li className="step-group-head">
+                    Group {r.group.replace(/^g/, '')}:{' '}
+                    {r.phase === 'alone' ? `each test on its own for ${f0(groupDur)} s, for comparison` : `all together for ${f0(groupDur)} s`}
+                  </li>
+                )}
+                <li className={`step-row step-${r.status}${r.group ? ' step-grouped' : ''}`}>
+                  <StepIcon s={r.status} />
+                  <div className="step-main">
+                    <div className="step-title">{r.title}</div>
+                    <div className="cell-sub">
+                      {r.status === 'running' && 'running…'}
+                      {r.status === 'ok' && `${r.seconds ? `${f1(r.seconds)} s` : '<0.1 s'}${r.headline ? ' · ' + r.headline : ''}`}
+                      {r.status === 'error' && <span className="text-critical">{r.error || 'failed'}</span>}
+                      {r.status === 'skipped' && 'skipped'}
+                      {r.status === 'earlier' && 'finished before this page opened'}
+                      {r.status === 'pending' && <code className="small">{r.test}</code>}
+                    </div>
                   </div>
-                </div>
-              </li>
+                </li>
+              </Fragment>
             ))}
           </ol>
         </Card>
         <div className="live-charts">
-          {(st.throughput.size > 0 || (st.sweep.length === 0 && st.sqm.length === 0 && st.sessionRtt.size === 0 && st.capacity.length === 0)) && (
-            <Card title={`Live throughput${st.throughputStep ? ` · ${st.throughputStep}` : ''}`}>
+          {(st.throughput.size > 0 || (st.sweep.size === 0 && st.sqm.length === 0 && st.sessionRtt.size === 0 && st.capacity.length === 0)) && (
+            <Card title={`Live throughput${thrTitle ? ` · ${thrTitle}` : ''}`}>
               {st.throughput.size ? (
-                <Figure title="Throughput at the receiver" option={thrOpt} height={240} />
+                thrCDP ? (
+                  <Figure
+                    title="Replication throughput at the receiver (changed data sent)"
+                    option={thr.option}
+                    height={240}
+                    note={`${thr.test === 'cdp-down' ? 'The server side is the source.' : 'This agent is the source.'} Write bursts show as peaks; a flat top that outlasts a burst means changes are waiting. The lag, the RPO the replica would have had, is worked out when the step ends.`}
+                  />
+                ) : thr.steps.length > 1 ? (
+                  <Figure
+                    title="Throughput at the receiver, by test"
+                    option={thr.option}
+                    height={240}
+                    note="These tests run at the same time, so they share the path."
+                  />
+                ) : (
+                  <Figure title="Throughput at the receiver" option={thr.option} height={240} />
+                )
               ) : (
-                <Empty>Throughput appears while a TCP, stream-scaling or bufferbloat test runs.</Empty>
+                <Empty>Throughput appears while a TCP, stream-scaling, bufferbloat or CDP replication test runs.</Empty>
               )}
             </Card>
           )}
@@ -381,7 +471,7 @@ export function LiveRun({ run, onChange }: { run: Run; onChange: () => void }) {
             </Card>
           )}
           {st.capacity.length > 0 && (
-            <Card title={`Capacity search · ${st.current?.title ?? st.latencyStep}`}>
+            <Card title={`Capacity search · ${running.find((r) => r.test.startsWith('capacity-'))?.title ?? st.latencyStep}`}>
               {st.capacity.length >= 2 && (
                 <Figure
                   title={`${capacityMetric(capKind).title} (so far)`}
@@ -400,12 +490,12 @@ export function LiveRun({ run, onChange }: { run: Run; onChange: () => void }) {
                 ))}
             </Card>
           )}
-          {st.sweep.length > 0 && (
-            <Card title={`Live rate sweep · ${st.current?.title ?? ''}`}>
-              <Figure title="Delivered vs offered rate" option={sweepOpt} height={220} />
-              <SweepTable steps={st.sweep} />
+          {sweeps.map((w) => (
+            <Card key={w.id} title={`Live rate sweep · ${stepTitle(w.id)}`}>
+              <Figure title="Delivered vs offered rate" option={w.option} height={220} />
+              <SweepTable steps={w.list} />
             </Card>
-          )}
+          ))}
           {st.sqm.length > 0 && (
             <Card title="SQM tuner">
               <ul className="log">

@@ -78,3 +78,67 @@ func TestCapacityFindings(t *testing.T) {
 		t.Errorf("limit wording: %q", x.Title)
 	}
 }
+
+func TestCDPFindings(t *testing.T) {
+	bad := &results.CDP{Settings: results.CDPSettings{RateMbps: 30, BurstS: 10, PeriodS: 60, RPOs: 15, LimitMbps: 40}, PeakMbps: 90,
+		Verdict: "poor", MaxLagS: 42.3, WithinRPOPct: 40, OverRPOS: 33, SustainedMbps: 40, Backlogged: true,
+		IdleRTT: stats.Summary{N: 20, Median: 12}, LoadedRTT: stats.Summary{N: 100, P95: 230}}
+	r := &results.Report{Steps: []results.Step{step("cdp", "cdp", bad)}}
+	Analyze(r, Expectations{})
+	f := ids(r)
+	m, ok := f["cdp.rpo.missed"]
+	if !ok || m.Severity != "critical" || !strings.Contains(m.Recommendation, "40 Mbit/s throttle") || !strings.Contains(m.Recommendation, "43 s") {
+		t.Errorf("missed RPO finding: %+v", m)
+	}
+	if l, ok := f["cdp.latency"]; !ok || !strings.Contains(l.Title, "218 ms") {
+		t.Errorf("latency finding: %+v", l)
+	}
+	good := &results.CDP{Settings: results.CDPSettings{RateMbps: 5, RPOs: 15, BurstS: 10, PeriodS: 60}, Verdict: "good", MaxLagS: 0.4}
+	r = &results.Report{Steps: []results.Step{step("cdp", "cdp", good)}}
+	Analyze(r, Expectations{})
+	if _, ok := ids(r)["cdp.rpo.ok"]; !ok {
+		t.Errorf("want cdp.rpo.ok: %v", ids(r))
+	}
+}
+
+func TestLoadComparisons(t *testing.T) {
+	lat := func(p95 float64) *results.Latency {
+		return &results.Latency{UDP: stats.Summary{N: 100, Median: p95 - 2, P95: p95}}
+	}
+	voip := func(mos float64) *results.VoIP {
+		return &results.VoIP{Up: results.VoIPDir{MOS: mos}, Down: results.VoIPDir{MOS: mos}, Verdict: "good"}
+	}
+	grouped := func(s results.Step, phase string) results.Step {
+		s.Group, s.Phase = "g1", phase
+		s.ID = "s01-g1-" + phase + "-" + s.ID
+		return s
+	}
+	r := &results.Report{
+		Groups: []results.Group{{ID: "g1", Tests: []string{"latency", "voip", "cdp-up"}, DurationS: 30, Baseline: true}},
+		Steps: []results.Step{
+			grouped(step("latency", "latency", lat(22)), "alone"),
+			grouped(step("voip", "voip", voip(4.4)), "alone"),
+			grouped(step("latency", "latency", lat(340)), "together"),
+			grouped(step("voip", "voip", voip(3.1)), "together"),
+		},
+	}
+	Analyze(r, Expectations{})
+	f := ids(r)
+	w, ok := f["group.g1.worse"]
+	if !ok || !strings.Contains(w.Detail, "round trip (p95) 22.0 ms → 340.0 ms") || !strings.Contains(w.Detail, "4.40 → 3.10") {
+		t.Fatalf("worse finding: %+v", w)
+	}
+	worse := 0
+	for _, c := range r.LoadComparisons {
+		if c.Worse {
+			worse++
+		}
+	}
+	if len(r.LoadComparisons) != 3 || worse != 2 {
+		t.Errorf("comparisons: %+v", r.LoadComparisons)
+	}
+	// The 340 ms measured under load must not count as the link's idle latency.
+	if r.Summary.IdleRTTms > 30 {
+		t.Errorf("idle RTT taken from a loaded step: %v", r.Summary.IdleRTTms)
+	}
+}

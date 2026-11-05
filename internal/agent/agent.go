@@ -513,13 +513,32 @@ func (a *Agent) buildOptions(req agentproto.RunRequest) (engine.Options, []strin
 	}
 	o := engine.Options{Profile: req.Profile, Tests: req.Tests, Skip: req.Skip, Scale: req.Scale, MaxRateMbps: req.MaxRateMbps,
 		Streams: req.Streams, TraceCycles: req.TraceCycles, Resolve: true, Mix: req.Mix, NoDSCP: req.NoDSCP,
+		GroupDurationS: req.GroupDurationS, NoBaseline: req.NoBaseline,
 		Labels: results.LinkLabels{Client: req.ClientName, Endpoint: req.ServerName}}
+	if req.CDP != nil {
+		o.CDP = *req.CDP
+	}
 	tests, err := o.TestList()
 	if err != nil {
 		return o, nil, err
 	}
 	var notes, allowed []string
 	for _, t := range tests {
+		if engine.IsGroup(t) {
+			// A group runs only if the policy allows every test in it.
+			ok := true
+			for _, m := range engine.GroupMembers(t) {
+				if !a.policy.AllowsTest(m) {
+					notes = append(notes, "skipped group "+t+" ("+m+" is not allowed by the agent's local policy)")
+					ok = false
+					break
+				}
+			}
+			if ok {
+				allowed = append(allowed, t)
+			}
+			continue
+		}
 		switch {
 		case !a.policy.AllowsTest(t):
 			notes = append(notes, "skipped "+t+" (not allowed by the agent's local policy)")

@@ -7,6 +7,7 @@ import type {
   BloatResult,
   CapacityResult,
   CCResult,
+  CDPResult,
   DiscriminationResult,
   HostReport,
   InfoResult,
@@ -33,6 +34,7 @@ import { Badge, DataTable } from './ui';
 import { CheckBadge, HostSummaryLine } from './HostDiag';
 import { GradeBadge } from './shared';
 import { CapacityView, MixView, capacityHeadline, mixHeadline } from './MixResult';
+import { CDPView, cdpHeadline } from './CDPResult';
 
 const sumHead = ['Measure', 'Samples', 'Min', 'Median', 'Mean', 'p95', 'p99', 'Max', 'Std dev'];
 function sumRow(label: string, s: StatSummary | null | undefined): ReactNode[] {
@@ -42,7 +44,8 @@ function sumRow(label: string, s: StatSummary | null | undefined): ReactNode[] {
 
 const dirName = (d: string) => ({ up: 'upload', down: 'download', bidir: 'both directions' })[d] ?? d;
 
-export function StepSection({ step, title }: { step: Step; title?: string }) {
+/** phase: "on its own, for comparison" or "together with …" for grouped steps. */
+export function StepSection({ step, title, phase }: { step: Step; title?: string; phase?: string }) {
   const statusBadge =
     step.status === 'ok' ? (
       <Badge kind="good" icon="✔" label="OK" />
@@ -55,7 +58,8 @@ export function StepSection({ step, title }: { step: Step; title?: string }) {
     <section className="card step" id={`step-${step.id}`} aria-labelledby={`step-h-${step.id}`}>
       <header className="card-head">
         <h3 id={`step-h-${step.id}`}>
-          {title ?? step.title}{' '}
+          {title ?? step.title}
+          {phase && <span className="step-phase"> ({phase})</span>}{' '}
           <small className="muted">
             {step.id} · {f1(step.seconds)} s
           </small>
@@ -116,6 +120,8 @@ export function StepBody({ step }: { step: Step }) {
       return <MixView v={r as MixResult} />;
     case 'capacity':
       return <CapacityView v={r as CapacityResult} />;
+    case 'cdp':
+      return <CDPView v={r as CDPResult} />;
   }
   return (
     <details>
@@ -164,6 +170,8 @@ export function stepHeadline(test: string, r: unknown): string {
         return mixHeadline(r as MixResult);
       case 'capacity':
         return capacityHeadline(r as CapacityResult);
+      case 'cdp':
+        return cdpHeadline(r as CDPResult);
     }
   } catch {
     return '';

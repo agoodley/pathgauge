@@ -152,7 +152,10 @@ export interface LineSeries {
   markers?: boolean;
   /** Marker size when markers is set (default 9, ring included). */
   markerSize?: number;
-  step?: boolean;
+  /** true: step at the midpoint; 'start': each value holds from the previous x (per-interval bins). */
+  step?: boolean | 'start';
+  /** A light wash of the series hue under the line. */
+  area?: boolean;
   dashed?: boolean;
   /** Override colour (only for a neutral "other" series). */
   color?: string;
@@ -162,6 +165,20 @@ export interface Band {
   from: number;
   to: number;
   label: string;
+}
+
+/** A horizontal reference line (a target or limit), labelled at its right end. */
+export interface RefLine {
+  y: number;
+  label: string;
+}
+
+/** Smallest 1, 2, 2.5 or 5 × 10^k at or above x (a clean axis maximum). */
+export function niceCeil(x: number): number {
+  if (!(x > 0)) return 1;
+  const p = Math.pow(10, Math.floor(Math.log10(x)));
+  for (const m of [1, 2, 2.5, 5, 10]) if (m * p >= x - 1e-9) return m * p;
+  return 10 * p;
 }
 
 export interface LineOpts {
@@ -183,6 +200,8 @@ export interface LineOpts {
   yMax?: number;
   /** Whole-number x ticks (hop counts, stream counts). */
   xInteger?: boolean;
+  /** Horizontal reference lines; the y-axis grows to show them. */
+  refLines?: RefLine[];
 }
 
 export function lineOption(P: Palette, o: LineOpts): Option {
@@ -194,6 +213,26 @@ export function lineOption(P: Palette, o: LineOpts): Option {
     { xAxis: b.from, name: b.label },
     { xAxis: b.to },
   ]);
+  const refs = o.refLines ?? [];
+  // A reference line above the data would be cut off: make room for it
+  // (with headroom for its label) on a clean maximum.
+  let yMax = o.yMax;
+  if (yMax === undefined && refs.length) {
+    const top = Math.max(...refs.map((r) => r.y));
+    const dataMax = Math.max(0, ...o.series.flatMap((s) => s.data.map((d) => d[1] ?? 0)));
+    if (top >= dataMax) yMax = niceCeil(top * 1.15);
+  }
+  const refLine = refs.length
+    ? {
+        silent: true,
+        symbol: 'none',
+        animation: false,
+        lineStyle: { color: P.text2, width: 1, type: 'dashed' },
+        label: { position: 'insideEndTop', color: P.text2, fontSize: 11, fontFamily: FONT },
+        emphasis: { disabled: true },
+        data: refs.map((r) => ({ yAxis: r.y, label: { formatter: r.label } })),
+      }
+    : undefined;
   return {
     animation: o.animation ?? false,
     textStyle: { fontFamily: FONT },
@@ -246,7 +285,7 @@ export function lineOption(P: Palette, o: LineOpts): Option {
       nameLocation: 'end',
       nameGap: 10,
       min: o.yMin ?? (o.yZero === false ? undefined : 0),
-      max: o.yMax,
+      max: yMax,
       ...ax,
       nameTextStyle: { ...ax.nameTextStyle, align: 'left' },
       axisLine: { show: false },
@@ -258,7 +297,8 @@ export function lineOption(P: Palette, o: LineOpts): Option {
         type: 'line',
         name: s.name,
         data: s.data,
-        step: s.step ? 'middle' : undefined,
+        step: s.step === true ? 'middle' : s.step || undefined,
+        areaStyle: s.area ? { color: c, opacity: 0.1 } : undefined,
         // A line needs two points; show markers while a series is that short.
         showSymbol: !!s.points || !!s.markers || s.data.length < 3,
         symbol: 'circle',
@@ -278,6 +318,7 @@ export function lineOption(P: Palette, o: LineOpts): Option {
                 data: bandData,
               }
             : undefined,
+        markLine: i === 0 ? refLine : undefined,
       };
     }),
   };

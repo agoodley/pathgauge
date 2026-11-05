@@ -43,6 +43,33 @@ type Report struct {
 	Summary   Summary    `json:"summary"`
 	Notes     []string   `json:"notes,omitempty"`
 	Labels    LinkLabels `json:"labels"`
+	// Groups are sets of tests run at the same time; LoadComparisons
+	// compare each test's key results alone and together.
+	Groups          []Group          `json:"groups,omitempty"`
+	LoadComparisons []LoadComparison `json:"load_comparisons,omitempty"`
+}
+
+// Group is a set of tests run at the same time.
+type Group struct {
+	ID        string   `json:"id"`
+	Tests     []string `json:"tests"`
+	DurationS float64  `json:"duration_s"`
+	Baseline  bool     `json:"baseline"` // each test also ran on its own first
+}
+
+// LoadComparison is one key result of a grouped test, on its own and
+// while the group's other tests ran.
+type LoadComparison struct {
+	Group    string   `json:"group"`
+	Test     string   `json:"test"`
+	Title    string   `json:"title"`
+	Others   []string `json:"others"` // tests that ran alongside
+	Metric   string   `json:"metric"`
+	Unit     string   `json:"unit"`
+	Alone    float64  `json:"alone"`
+	Together float64  `json:"together"`
+	Better   string   `json:"better"` // "higher" or "lower"
+	Worse    bool     `json:"worse"`  // noticeably worse together
 }
 
 // LinkLabels give friendly names to the two ends and directions.
@@ -71,6 +98,10 @@ type Step struct {
 	StartedAt time.Time `json:"started_at"`
 	Seconds   float64   `json:"seconds"`
 	Result    any       `json:"result,omitempty"`
+	// Group and Phase mark tests run in a group: "alone" for the baseline
+	// run on its own, "together" for the run alongside the group's others.
+	Group string `json:"group,omitempty"`
+	Phase string `json:"phase,omitempty"`
 }
 
 // stepAlias avoids recursion in UnmarshalJSON.
@@ -132,6 +163,8 @@ func NewResult(test string) any {
 		return &Mix{}
 	case "capacity":
 		return &Capacity{}
+	case "cdp":
+		return &CDP{}
 	case "sweep":
 		return &Sweep{}
 	case "sizesweep":
@@ -418,6 +451,9 @@ type VoIPDir struct {
 	MOS         float64         `json:"mos"`
 	R           float64         `json:"r_factor"`
 	Verdict     string          `json:"verdict"`
+	// PlayoutMs is the delay queues plus the adaptive jitter buffer added
+	// over the idle path (when the endpoint returned packet logs).
+	PlayoutMs float64 `json:"playout_ms,omitempty"`
 }
 
 // VoIP is a simulated voice call.
@@ -741,4 +777,56 @@ type CapacityStep struct {
 	LossPct    float64 `json:"loss_pct"`
 	AddedP95Ms float64 `json:"added_p95_ms"`
 	Verdict    string  `json:"verdict"`
+}
+
+// CDPSettings describes a simulated continuous-data-protection (CDP)
+// replication, such as Veeam CDP. Zero values mean the defaults.
+type CDPSettings struct {
+	RateMbps    float64 `json:"rate_mbps"`              // average changed data on the wire (after compression)
+	BurstFactor float64 `json:"burst_factor,omitempty"` // write bursts as a multiple of the average (default 3)
+	BurstS      float64 `json:"burst_s,omitempty"`      // length of each burst (default 10 s)
+	PeriodS     float64 `json:"period_s,omitempty"`     // time from one burst to the next (default 60 s)
+	LimitMbps   float64 `json:"limit_mbps,omitempty"`   // replication throttle (0: none)
+	Streams     int     `json:"streams,omitempty"`      // TCP connections (default 4)
+	RPOs        float64 `json:"rpo_s,omitempty"`        // target RPO (default 15 s)
+	DurationS   float64 `json:"duration_s,omitempty"`   // default 60 s × scale
+}
+
+// CDPPoint is one second of a CDP run.
+type CDPPoint struct {
+	T        float64 `json:"t"`
+	LagS     float64 `json:"lag_s"`
+	GenMbps  float64 `json:"gen_mbps"`
+	SentMbps float64 `json:"sent_mbps"`
+}
+
+// CDP is a simulated CDP replication run: changed data produced at a
+// steady rate with write bursts, sent to the other site as fast as the path
+// allows. Lag is the age of the oldest change not yet sent: the RPO the
+// replica would have had at that moment.
+type CDP struct {
+	Direction      Direction   `json:"direction"` // up: this side is the CDP source
+	Settings       CDPSettings `json:"settings"`  // as run, defaults filled in
+	AutoRate       bool        `json:"auto_rate,omitempty"`
+	BaseMbps       float64     `json:"base_mbps"` // rate between bursts
+	PeakMbps       float64     `json:"peak_mbps"` // rate during bursts
+	GeneratedMB    float64     `json:"generated_mb"`
+	SentMB         float64     `json:"sent_mb"`
+	ThroughputMbps float64     `json:"throughput_mbps"`
+	// SustainedMbps is what the path carried while changes were waiting
+	// (0 when nothing ever waited): the most CDP can count on.
+	SustainedMbps float64       `json:"sustained_mbps"`
+	Backlogged    bool          `json:"backlogged"`
+	MaxLagS       float64       `json:"max_lag_s"`
+	P95LagS       float64       `json:"p95_lag_s"`
+	MeanLagS      float64       `json:"mean_lag_s"`
+	EndLagS       float64       `json:"end_lag_s"`
+	WithinRPOPct  float64       `json:"within_rpo_pct"`
+	OverRPOS      float64       `json:"over_rpo_s"` // time the lag exceeded the RPO
+	RetransPct    float64       `json:"retrans_pct"`
+	IdleRTT       stats.Summary `json:"idle_rtt_ms"`
+	LoadedRTT     stats.Summary `json:"loaded_rtt_ms"` // latency probes while CDP ran
+	Points        []CDPPoint    `json:"points"`
+	Verdict       string        `json:"verdict"`
+	Notes         []string      `json:"notes,omitempty"`
 }

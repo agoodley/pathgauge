@@ -127,6 +127,10 @@ type testFlags struct {
 	streams, traceCycles                                                     int
 	noResolve, quiet, noSave, allowShaping, noDSCP                           bool
 	shapeIface, mix                                                          string
+	cdp                                                                      results.CDPSettings
+	together                                                                 []string
+	groupDuration                                                            float64
+	noBaseline                                                               bool
 }
 
 func newTestCmd() *cobra.Command {
@@ -175,6 +179,17 @@ Results are saved as JSON (see --json); render them again later with
 	fl.StringVar(&f.shapeIface, "shape-interface", "", "interface for the sqm test (default: the route to the endpoint)")
 	fl.StringVar(&f.mix, "mix", "", "traffic mix for the mix test: a scenario ("+strings.Join(mixScenarioList(), ", ")+") or kind:count,... (default "+engine.DefaultMix+")")
 	fl.BoolVar(&f.noDSCP, "no-dscp", false, "send simulated calls without DSCP markings (mix and capacity tests)")
+	fl.Float64Var(&f.cdp.RateMbps, "cdp-rate", 0, "CDP test: average changed data on the wire, Mbit/s, after compression (default: half the measured TCP rate)")
+	fl.Float64Var(&f.cdp.BurstFactor, "cdp-burst", 0, "CDP test: write bursts as a multiple of the average rate (default 3)")
+	fl.Float64Var(&f.cdp.BurstS, "cdp-burst-secs", 0, "CDP test: length of each write burst in seconds (default 10)")
+	fl.Float64Var(&f.cdp.PeriodS, "cdp-period", 0, "CDP test: seconds from one burst to the next (default 60)")
+	fl.Float64Var(&f.cdp.LimitMbps, "cdp-limit", 0, "CDP test: throttle replication to this many Mbit/s, like a Veeam traffic rule (default: none)")
+	fl.IntVar(&f.cdp.Streams, "cdp-streams", 0, "CDP test: TCP connections (default 4)")
+	fl.Float64Var(&f.cdp.RPOs, "cdp-rpo", 0, "CDP test: target RPO in seconds (default 15)")
+	fl.StringArrayVar(&f.together, "together", nil, "run these tests at the same time as a group, e.g. --together voip,cdp-up,tcp-down (repeatable; each test first runs alone for comparison)")
+	fl.Float64Var(&f.groupDuration, "group-duration", 0, "seconds each test in a group runs (default 30 × --scale, at least 15)")
+	fl.BoolVar(&f.noBaseline, "no-baseline", false, "don't run grouped tests on their own first")
+	fl.Float64Var(&f.cdp.DurationS, "cdp-duration", 0, "CDP test: seconds to run (default 60 × --scale; use several burst periods for sizing)")
 	return cmd
 }
 
@@ -198,7 +213,19 @@ func runTest(ctx context.Context, out, errOut io.Writer, host string, f testFlag
 		Profile: f.profile, Tests: f.tests, Skip: f.skip, Scale: f.scale, MaxRateMbps: f.maxRate,
 		TraceCycles: f.traceCycles, Resolve: !f.noResolve, Streams: f.streams,
 		Labels: results.LinkLabels{Client: f.clientName, Endpoint: f.endpointName},
-		Mix:    f.mix, NoDSCP: f.noDSCP,
+		Mix:    f.mix, NoDSCP: f.noDSCP, CDP: f.cdp,
+		GroupDurationS: f.groupDuration, NoBaseline: f.noBaseline,
+	}
+	if len(f.together) > 0 {
+		if len(opts.Tests) == 0 {
+			opts.Tests = []string{"info", "latency"}
+		}
+		for _, g := range f.together {
+			opts.Tests = append(opts.Tests, strings.ReplaceAll(strings.ReplaceAll(g, " ", ""), ",", "+"))
+		}
+	}
+	if f.cdp != (results.CDPSettings{}) && len(f.tests) == 0 && f.mix == "" {
+		opts.Tests = []string{"info", "cdp-up"} // --cdp-* alone runs just the CDP test
 	}
 	if f.mix != "" {
 		if _, _, err := engine.ParseMix(f.mix); err != nil {

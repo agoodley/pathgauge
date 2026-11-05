@@ -221,6 +221,40 @@ scenario_capacity() {
         'finding("capacity.voice")'
 }
 
+scenario_cdp() {
+    # CDP replication over a 20 Mbit/s FIFO with a 200 ms buffer. Bursts
+    # below the link rate keep a tight RPO; bursts above it fall behind and
+    # fill the queue for everyone else.
+    lab impair a2b --delay 10ms --rate 20mbit --buffer 200ms
+    lab impair b2a --delay 10ms --rate 20mbit --buffer 200ms
+    client cdpok --tests cdp-up --cdp-rate 4 --cdp-burst-secs 5 --cdp-period 15 --cdp-duration 30 || return 1
+    check cdpok 'steps_ok()' \
+        'res("cdp")["verdict"] == "good"' \
+        'res("cdp")["max_lag_s"] < 1' \
+        'approx(res("cdp")["throughput_mbps"], 4, 15)' \
+        'finding("cdp.rpo.ok")' || return 1
+    client cdpover --tests cdp-up --cdp-rate 12 --cdp-burst-secs 5 --cdp-period 15 --cdp-duration 30 --cdp-rpo 2 || return 1
+    check cdpover 'steps_ok()' \
+        'res("cdp")["verdict"] == "poor"' \
+        'res("cdp")["backlogged"] and approx(res("cdp")["sustained_mbps"], 19, 15)' \
+        'res("cdp")["max_lag_s"] > 2' \
+        'finding("cdp.rpo.missed") and finding("cdp.latency")'
+}
+
+scenario_group() {
+    # Latency, a voice call and CDP replication run on their own and then
+    # together over a 20 Mbit/s FIFO: together, the replication bursts fill
+    # the queue and the others get worse, which the comparison must show.
+    lab impair a2b --delay 10ms --rate 20mbit --buffer 200ms
+    lab impair b2a --delay 10ms --rate 20mbit --buffer 200ms
+    client group --tests latency+voip+cdp-up --group-duration 20 --cdp-rate 12 --cdp-burst-secs 5 --cdp-period 10 || return 1
+    check group 'steps_ok()' \
+        'len(R["groups"]) == 1 and R["groups"][0]["baseline"]' \
+        'len([s for s in R["steps"] if s.get("phase") == "together"]) == 3' \
+        'any(c["test"] == "latency" and c["worse"] for c in R["load_comparisons"])' \
+        'finding("group.g1.worse")'
+}
+
 scenario_ipv6() {
     # The same checks over IPv6, through two routers, with a 1400-byte
     # link so Packet Too Big handling is exercised.
@@ -340,7 +374,7 @@ trap './netns.sh down >/dev/null 2>&1' EXIT
 ./netns.sh exec a "$PG" endpoint --listen "[$A6]:7401" --key "$KEY" --log-level warn > "$OUT/endpoint6.log" 2>&1 &
 sleep 1
 
-ALL=(clean bufferbloat cake policer shaper loss reorder middlebox pmtu_blackhole pmtu_ok nat owd sqm unprivileged ipv6 qos_fifo qos_prio mix_fifo mix_cake mix_prio capacity)
+ALL=(clean bufferbloat cake policer shaper loss reorder middlebox pmtu_blackhole pmtu_ok nat owd sqm unprivileged ipv6 qos_fifo qos_prio mix_fifo mix_cake mix_prio capacity cdp group)
 SEL=("$@")
 [ ${#SEL[@]} -eq 0 ] && SEL=("${ALL[@]}")
 for s in "${SEL[@]}"; do run "$s"; done

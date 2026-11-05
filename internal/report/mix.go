@@ -3,6 +3,7 @@ package report
 import (
 	"fmt"
 	"html"
+	"html/template"
 	"sort"
 	"strings"
 
@@ -145,4 +146,120 @@ func capacitySection(b *strings.Builder, v *results.Capacity) {
 	if v.WithTransfers != nil {
 		render("While a download and an upload run", *v.WithTransfers)
 	}
+}
+
+func cdpSection(b *strings.Builder, v *results.CDP, id string) {
+	set := v.Settings
+	dir := "from this host to the other"
+	if v.Direction == results.Down {
+		dir = "from the other host to this one"
+	}
+	limit := "no throttle"
+	if set.LimitMbps > 0 {
+		limit = fmt.Sprintf("throttled to %.0f Mbit/s", set.LimitMbps)
+	}
+	fmt.Fprintf(b, `<p>Replication %s: %.0f Mbit/s of changed data on average, %.0f Mbit/s between bursts and %.0f Mbit/s during %.0f s bursts every %.0f s; %d connections, %s, target RPO %.0f s, %.0f s run. Overall: <b>%s</b>.</p>`,
+		dir, set.RateMbps, v.BaseMbps, v.PeakMbps, set.BurstS, set.PeriodS, set.Streams, limit, set.RPOs, set.DurationS, verdictLabel(v.Verdict))
+	var t, lag, rpo, gen, sent []float64
+	for _, p := range v.Points {
+		t = append(t, p.T)
+		lag = append(lag, p.LagS)
+		rpo = append(rpo, set.RPOs)
+		gen = append(gen, p.GenMbps)
+		sent = append(sent, p.SentMbps)
+	}
+	if len(t) > 1 {
+		b.WriteString(string(LineChart{ID: id + "-lag", Title: "Replication lag (the RPO the replica had) against the target", XLabel: "seconds", YLabel: "lag (s)", YZero: true,
+			Series: []Series{{Name: "lag", X: t, Y: lag, Slot: 1}, {Name: "target RPO", X: t, Y: rpo, Slot: 2}}}.SVG()))
+		b.WriteString(string(LineChart{ID: id + "-rate", Title: "Changed data produced and sent", XLabel: "seconds", YLabel: "Mbit/s", YZero: true,
+			Series: []Series{{Name: "produced", X: t, Y: gen, Slot: 1}, {Name: "sent", X: t, Y: sent, Slot: 2}}}.SVG()))
+	}
+	sustained := "never had to wait"
+	if v.Backlogged {
+		sustained = fmt.Sprintf("%.1f Mbit/s", v.SustainedMbps)
+	}
+	table(b, []string{"Measure", "Value"}, [][]string{
+		{"Worst lag", fmt.Sprintf("%.1f s", v.MaxLagS)},
+		{"Lag p95 / mean / at the end", fmt.Sprintf("%.1f / %.1f / %.1f s", v.P95LagS, v.MeanLagS, v.EndLagS)},
+		{"Time within the RPO", fmt.Sprintf("%.0f%% (over it for %.0f s)", v.WithinRPOPct, v.OverRPOS)},
+		{"Changed data produced / sent", fmt.Sprintf("%.0f / %.0f MB", v.GeneratedMB, v.SentMB)},
+		{"Average sent", fmt.Sprintf("%.1f Mbit/s", v.ThroughputMbps)},
+		{"Path carried while changes waited", sustained},
+		{"Retransmitted", fmt.Sprintf("%.2f%%", v.RetransPct)},
+		{"Round trip idle / during (p95)", fmt.Sprintf("%.1f / %.1f ms", v.IdleRTT.Median, v.LoadedRTT.P95)},
+	})
+	for _, n := range v.Notes {
+		fmt.Fprintf(b, `<p class="muted">%s</p>`, html.EscapeString(n))
+	}
+}
+
+// phaseLabel marks a grouped step as run alone or together.
+func phaseLabel(r *results.Report, s results.Step) string {
+	switch s.Phase {
+	case "alone":
+		return " (on its own, for comparison)"
+	case "together":
+		for _, g := range r.Groups {
+			if g.ID == s.Group {
+				return " (together with " + strings.Join(othersThan(g.Tests, s.ID), ", ") + ")"
+			}
+		}
+		return " (together with the group)"
+	}
+	return ""
+}
+
+func othersThan(tests []string, stepID string) []string {
+	// Trace and MTR steps end in -fwd / -rev (one per direction).
+	stepID = strings.TrimSuffix(strings.TrimSuffix(stepID, "-fwd"), "-rev")
+	var out []string
+	for _, t := range tests {
+		if !strings.HasSuffix(stepID, "-"+t) {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// loadSection compares grouped tests alone and together.
+func loadSection(r *results.Report) template.HTML {
+	if len(r.Groups) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(`<section><h2>Tests run together</h2>`)
+	for _, g := range r.Groups {
+		fmt.Fprintf(&b, `<p><b>%s</b> ran at the same time, each for %.0f s.`, html.EscapeString(strings.Join(g.Tests, " + ")), g.DurationS)
+		if !g.Baseline {
+			b.WriteString(` They didn't run on their own first, so there is nothing to compare with.</p>`)
+			continue
+		}
+		b.WriteString(` Each first ran on its own for the same time.</p>`)
+		var rows [][]string
+		for _, c := range r.LoadComparisons {
+			if c.Group != g.ID {
+				continue
+			}
+			mark := "✔ Similar"
+			if c.Worse {
+				mark = "▲ Worse"
+			}
+			rows = append(rows, []string{c.Title, c.Metric, loadVal(c.Alone, c.Unit), loadVal(c.Together, c.Unit), mark})
+		}
+		if len(rows) > 0 {
+			table(&b, []string{"Test", "Measure", "On its own", "Together", "Change"}, rows)
+		}
+	}
+	b.WriteString(`</section>`)
+	return template.HTML(b.String())
+}
+
+func loadVal(v float64, unit string) string {
+	switch unit {
+	case "":
+		return f2(v)
+	case "%":
+		return f1(v) + "%"
+	}
+	return f1(v) + " " + unit
 }

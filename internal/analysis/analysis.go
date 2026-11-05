@@ -84,7 +84,9 @@ func dirName(r *results.Report, d results.Direction) string {
 
 // Analyze fills r.Findings and r.Summary.
 func Analyze(r *results.Report, exp Expectations) {
-	v := view{r}
+	// Steps run together in a group were measured under load: the ordinary
+	// rules ignore them, and loadComparisons covers them instead.
+	v := view{withoutLoaded(r)}
 	var f []results.Finding
 	add := func(x results.Finding) { f = append(f, x) }
 	sum := results.Summary{ScoreParts: map[string]float64{}, Fingerprint: map[string]string{}}
@@ -547,6 +549,12 @@ func Analyze(r *results.Report, exp Expectations) {
 			add(x)
 		}
 	}
+	cdps, cdpIDs := all[results.CDP](v, "cdp")
+	for i, c := range cdps {
+		for _, x := range cdpFindings(c, cdpIDs[i]) {
+			add(x)
+		}
+	}
 	caps, capIDs := all[results.Capacity](v, "capacity")
 	for i, cp := range caps {
 		for _, x := range capacityFindings(cp, capIDs[i]) {
@@ -603,6 +611,9 @@ func Analyze(r *results.Report, exp Expectations) {
 			Title: "No problems detected", Detail: "Every test completed without finding a problem."})
 	}
 	sort.SliceStable(f, func(i, j int) bool { return sevRank(f[i].Severity) < sevRank(f[j].Severity) })
+	lc, lf := loadComparisons(r)
+	r.LoadComparisons = lc
+	f = append(f, lf...)
 	r.Findings, r.Summary = f, sum
 }
 

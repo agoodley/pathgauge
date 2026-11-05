@@ -1,4 +1,6 @@
 // Domain helpers: status classes, severities, duration estimates.
+import { cdpDefaultDuration } from './cdp';
+import { groupDefaultDuration, planSteps, type PlannedStep } from './groups';
 import type { Agent, CheckStatus, Run } from './types';
 
 export type StatusKind = 'good' | 'warning' | 'serious' | 'critical' | 'info' | 'neutral';
@@ -125,14 +127,74 @@ const baseSeconds: Record<string, [scaled: number, fixed: number]> = {
   'capacity-video': [100, 40],
 };
 
-export function estimateSeconds(tests: string[], scale: number): number {
+// In a group every timed phase of a test lasts the group duration, so tests
+// that run in phases take that many times as long: stream counts, the idle
+// and three loaded bufferbloat phases, sweep steps, packet sizes, the
+// congestion-control algorithms (typically 2–3), the throttling checks,
+// QoS idle and loaded, the traffic mix with and without transfers.
+const groupPhases: Record<string, number> = {
+  'streams-down': 5,
+  'streams-up': 5,
+  bufferbloat: 4,
+  'sweep-down': 10,
+  'sweep-up': 10,
+  'sizesweep-up': 7,
+  'sizesweep-down': 7,
+  cc: 3,
+  discrimination: 3,
+  qos: 2,
+  mix: 2,
+};
+
+export interface EstimateOpts {
+  /** Duration set for the CDP tests (empty: 60 s × scale, at least 20 s). */
+  cdpDurationS?: number;
+  /** Duration of each grouped test (empty: 30 s × scale, at least 15 s). */
+  groupDurationS?: number;
+  /** Grouped tests run on their own first (default true). */
+  baseline?: boolean;
+}
+
+function testSeconds(t: string, s: number, o: EstimateOpts): number {
+  if (t === 'cdp-up' || t === 'cdp-down') return (o.cdpDurationS && o.cdpDurationS > 0 ? o.cdpDurationS : cdpDefaultDuration(s)) + 5;
+  const [a, b] = baseSeconds[t] ?? [10, 2];
+  return a * s + b + 1;
+}
+
+/** One test in a group, every timed phase lasting d seconds. */
+export function groupedTestSeconds(t: string, d: number): number {
+  if (t === 'cdp-up' || t === 'cdp-down') return d + 5;
+  const [a, b] = baseSeconds[t] ?? [10, 2];
+  return (a > 0 ? (groupPhases[t] ?? 1) * d : 0) + b + 1;
+}
+
+/** One group: each test on its own (with a 1 s pause after each), then all together. */
+export function groupSeconds(members: string[], d: number, baseline: boolean): number {
+  const each = members.map((t) => groupedTestSeconds(t, d));
+  return (baseline ? each.reduce((a, x) => a + x + 1, 0) : 0) + Math.max(0, ...each);
+}
+
+/**
+ * Rough time for a list of planned steps: steps of a group's "together"
+ * phase overlap, so the phase takes as long as its longest test.
+ */
+export function estimateSteps(steps: Pick<PlannedStep, 'test' | 'group' | 'phase'>[], scale: number, o: EstimateOpts = {}): number {
   const s = scale > 0 ? scale : 1;
+  const d = o.groupDurationS && o.groupDurationS > 0 ? o.groupDurationS : groupDefaultDuration(s);
   let total = 3;
-  for (const t of tests) {
-    const [a, b] = baseSeconds[t] ?? [10, 2];
-    total += a * s + b + 1;
+  const together = new Map<string, number>();
+  for (const st of steps) {
+    if (!st.group) total += testSeconds(st.test, s, o);
+    else if (st.phase === 'alone') total += groupedTestSeconds(st.test, d) + 1;
+    else together.set(st.group, Math.max(together.get(st.group) ?? 0, groupedTestSeconds(st.test, d)));
   }
+  for (const v of together.values()) total += v;
   return total;
+}
+
+/** Rough run time in seconds of a test list ("a+b" entries are groups). */
+export function estimateSeconds(tests: string[], scale: number, o: EstimateOpts = {}): number {
+  return estimateSteps(planSteps(tests, o.baseline ?? true), scale, o);
 }
 
 /** The test list a run executes (custom list, else the profile's). */

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"math"
 	"net"
 	"sync"
 	"time"
@@ -27,6 +28,11 @@ type TCPPrepare struct {
 	// Bytes, if > 0, makes a sending endpoint stop after this many bytes
 	// per stream (short-flow tests).
 	Bytes uint64 `json:"bytes,omitempty"`
+	// CDP, if set, makes a sending endpoint replicate simulated changed
+	// data (continuous data protection) across its streams instead of bulk
+	// data; CDPLimitBps caps it like a replication throttle.
+	CDP         *flow.CDPModel `json:"cdp,omitempty"`
+	CDPLimitBps float64        `json:"cdp_limit_bps,omitempty"`
 }
 
 // TCPPrepared lists the stream IDs to connect.
@@ -51,6 +57,7 @@ type TCPResult struct {
 	Streams    []TCPStreamResult `json:"streams"`
 	Samples    []flow.Sample     `json:"samples"`
 	Error      string            `json:"error,omitempty"`
+	CDP        *flow.CDPResult   `json:"cdp,omitempty"` // CDP sends only
 }
 
 // TCPSampleEvent streams live samples to the client.
@@ -73,6 +80,7 @@ type tcpTest struct {
 	sampler  flow.Sampler
 	err      error
 	timer    *time.Timer
+	cdp      *flow.CDPResult
 }
 
 func (ss *session) tcpPrepare(p TCPPrepare) (TCPPrepared, error) {
@@ -81,6 +89,15 @@ func (ss *session) tcpPrepare(p TCPPrepare) (TCPPrepared, error) {
 	}
 	if p.Role != "send" && p.Role != "recv" && p.Role != "hold" {
 		return TCPPrepared{}, errors.New("role must be send, recv or hold")
+	}
+	if p.CDP != nil {
+		if p.CDP.RateBps <= 0 {
+			return TCPPrepared{}, errors.New("CDP rate must be positive")
+		}
+		_, peak := p.CDP.Rates()
+		if err := ss.checkRate(math.Max(peak*8, p.CDPLimitBps)); err != nil {
+			return TCPPrepared{}, err
+		}
 	}
 	if err := ss.checkDuration(time.Duration(p.DurationMs) * time.Millisecond); err != nil {
 		return TCPPrepared{}, err
@@ -188,6 +205,16 @@ func (t *tcpTest) run(streams []*flow.Stream) {
 		t.sampler.Run(sctx, streams, onSample)
 		close(sampDone)
 	}()
+	if t.p.Role == "send" && t.p.CDP != nil {
+		res := flow.SendCDP(ctx, streams, *t.p.CDP, t.p.CDPLimitBps, d)
+		t.cdp = &res
+		for _, s := range streams {
+			_ = s.Conn.CloseWrite()
+		}
+		scancel()
+		<-sampDone
+		return
+	}
 	var wg sync.WaitGroup
 	for _, s := range streams {
 		wg.Add(1)
@@ -235,6 +262,7 @@ func (ss *session) tcpResult(id string, wait time.Duration) (TCPResult, error) {
 	if t.err != nil {
 		r.Error = t.err.Error()
 	}
+	r.CDP = t.cdp
 	for _, s := range t.streams {
 		sr := TCPStreamResult{Stream: s.ID, Bytes: s.Bytes(), Congestion: netx.Congestion(s.Conn)}
 		if ti, err := netx.TCPInfo(s.Conn); err == nil {

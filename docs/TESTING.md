@@ -7,7 +7,7 @@ PathGauge is tested in layers. The aim is that measurements are proven correct a
 | Unit tests | Maths and logic: percentiles, RFC 3550 jitter, loss/reorder/duplicate/burst tracking, MOS, grades, the Mathis bound, the wire protocol and MACs, config and policy validation, `doctor` against simulated Rocky 8 / Ubuntu hosts, the diagnosis rules (from fixtures), sweep classification, PMTU bisection, DSCP/ECN classification, traceroute loss interpretation, the pacer (including a regression test for a slow sender), password hashing, alert evaluation, monitoring rollups | `make test` |
 | Loopback integration | A real endpoint and client in one process: latency, TCP both directions with live intervals and sender `TCP_INFO`, stream scaling, wrong-key rejection | `go test ./internal/engine/` |
 | Server + agent integration | An in-process server and agent over real TLS and WebSockets (detailed below) | `go test ./internal/server/` |
-| Network-namespace lab | 21 scenarios, each building a known fault with tc, nftables and netem, then checking PathGauge's measurements **and** diagnosis (see below) | `make lab-scenarios` |
+| Network-namespace lab | 23 scenarios, each building a known fault with tc, nftables and netem, then checking PathGauge's measurements **and** diagnosis (see below) | `make lab-scenarios` |
 | Packages | Install, reinstall (configuration kept), remove, ownership and permissions, `systemd-analyze verify` on Ubuntu 22.04/24.04/26.04 and Rocky 8/9/10 | `make install-test` |
 | Packaged end to end | The RPM installed in systemd containers, a **Rocky 9 server and a Rocky 8 agent**, put through the full server/agent workflow (detailed below) | `make e2e` |
 | Real world | Peer and server modes over the internet across three continents (client behind NAT, on Wi-Fi), including the SQM tuner shaping a live VPS | manual |
@@ -60,4 +60,6 @@ The lab (`lab/netns.sh`) has two endpoints with two routers between them. Delay,
 | mix_cake | the same rates with CAKE | Calls stay good while transfers run; browsing good; no voice "degraded" finding |
 | mix_prio | 20/10 Mbit/s FIFO with strict priority for EF | Marked voice stays good under transfers; video (AF41, not prioritised) is poor |
 | capacity | 4 Mbit/s each way with fq_codel | Voice capacity 30–56 calls (about 50 fit), 20–56 while transfers run |
+| cdp | 20 Mbit/s FIFO with a 200 ms buffer; CDP replication at 4 and then 12 Mbit/s average (bursts of 12 and 36 Mbit/s) | Bursts under the link rate: lag under 1 s, "good", throughput 4 Mbit/s ±15%. Bursts over it: lag over a 2 s RPO, "poor", the path carried ~19 Mbit/s while changes waited, RPO and latency findings |
+| group | 20 Mbit/s FIFO; latency, a voice call and CDP replication alone and then together | Three "together" steps; latency marked worse together (round trip p95 20 → ~215 ms); a "group got worse" finding |
 | ipv6 | IPv6 through both routers, 1400-byte link | RTT, 3 hops, TCP and UDP, path MTU 1400 each way from Packet Too Big, DSCP preserved through the traffic class, hop limits |

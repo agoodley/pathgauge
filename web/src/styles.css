@@ -884,6 +884,10 @@ input[type='file'] {
   align-items: center;
   cursor: pointer;
 }
+/* A label that wraps must not squeeze the box. */
+.check > input {
+  flex: none;
+}
 .toolbar {
   display: flex;
   gap: 16px;
@@ -1286,6 +1290,183 @@ td.mix-flow {
   color: var(--text-2);
 }
 
+/* ---- run together (test groups) ---- */
+
+.together {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.together h3 {
+  margin: 0;
+  font-size: 15px;
+}
+.together-intro {
+  margin: 0;
+  color: var(--text-2);
+}
+.group-box {
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  padding: 8px 12px 10px;
+  margin: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.group-box legend {
+  font-weight: 600;
+  font-size: 12px;
+  color: var(--text-2);
+  padding: 0 4px;
+}
+.group-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+.group-row select {
+  /* Sized by its longest option (with the reason a test can't be grouped) otherwise. */
+  width: 18em;
+  max-width: 100%;
+}
+.group-members {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.member {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  border-radius: 999px;
+  padding: 1px 2px 1px 10px;
+  font-size: 13px;
+  max-width: 100%;
+}
+.member code {
+  white-space: nowrap;
+}
+.together-settings > .field {
+  flex: 0 1 200px;
+}
+.member-x {
+  flex: none;
+  border: 0;
+  background: none;
+  color: var(--text-2);
+  cursor: pointer;
+  font: inherit;
+  font-size: 16px;
+  line-height: 1;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+}
+.member-x:hover {
+  background: var(--grid);
+  color: var(--text);
+}
+.group-error {
+  margin: 0;
+  color: var(--critical);
+  font-size: 12.5px;
+}
+/* Grouped steps: live list, result headings and index, the under-load card. */
+.step-group-head {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+  padding: 10px 0 4px;
+  border-bottom: 1px solid var(--line);
+}
+.step-row.step-grouped {
+  padding-left: 12px;
+}
+.step-phase {
+  font-weight: 500;
+  color: var(--text-2);
+}
+.step-index-phase {
+  color: var(--muted);
+}
+.load-group + .load-group {
+  margin-top: 18px;
+}
+.load-group h3 {
+  margin: 0 0 4px;
+  font-size: 14px;
+}
+.load-group p {
+  margin: 0 0 8px;
+}
+/* Narrow screens scroll the table rather than stacking every word. */
+.load-table td:first-child {
+  min-width: 11em;
+}
+.load-table td:nth-child(2) {
+  min-width: 9em;
+}
+.load-table td:last-child {
+  white-space: nowrap;
+}
+
+/* ---- CDP replication ---- */
+
+.cdp-options {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.cdp-intro {
+  margin: 0;
+  max-width: 75em;
+}
+.cdp-dirs {
+  margin: -6px 0 0;
+}
+.cdp-fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 14px 16px;
+}
+.cdp-fields input {
+  font-variant-numeric: tabular-nums;
+}
+.cdp-fields input[aria-invalid='true'] {
+  border-color: var(--critical);
+  box-shadow: 0 0 0 1px var(--critical);
+}
+.cdp-readout {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.cdp-readout p {
+  margin: 0;
+}
+.cdp-overview {
+  line-height: 1.8;
+  margin-top: 0;
+}
+.cdp-tiles {
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  margin-bottom: 12px;
+}
+.cdp-summary {
+  max-width: 44em;
+}
+
 /* ---- tiles ---- */
 
 .tiles {
@@ -1638,6 +1819,10 @@ span.spinner.step-icon {
 @media (max-width: 520px) {
   .link-tile-metrics {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .cdp-fields {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 12px;
   }
   .tile-value {
     font-size: 19px;

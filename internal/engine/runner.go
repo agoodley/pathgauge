@@ -54,6 +54,16 @@ type Options struct {
 	// "office"). NoDSCP sends the simulated calls unmarked.
 	Mix    string
 	NoDSCP bool
+	// CDP configures the cdp-up and cdp-down tests (simulated continuous
+	// data protection replication, such as Veeam CDP).
+	CDP results.CDPSettings
+	// GroupDurationS is how long each test in a group ("a+b+c" in the test
+	// list) runs (default 30 s × Scale, at least 15 s). NoBaseline skips
+	// running each grouped test on its own first.
+	GroupDurationS float64
+	NoBaseline     bool
+
+	groupDur time.Duration // set while a group runs
 }
 
 // SQMHooks lets the runner drive local shaping without importing it.
@@ -72,7 +82,7 @@ var Profiles = map[string][]string{
 // AllTests lists every runnable test ID.
 var AllTests = []string{"info", "latency", "trace", "mtr", "tcp-down", "tcp-up", "tcp-down-1", "tcp-up-1", "streams-down", "streams-up",
 	"udp-down", "udp-up", "bufferbloat", "sweep-down", "sweep-up", "sizesweep-up", "sizesweep-down", "pmtu", "integrity", "voip", "voip-loaded",
-	"qos", "mix", "capacity-voice", "capacity-video", "cc", "shortflow", "discrimination", "sqm"}
+	"qos", "mix", "capacity-voice", "capacity-video", "cdp-up", "cdp-down", "cc", "shortflow", "discrimination", "sqm"}
 
 // Titles are human names for test IDs.
 var Titles = map[string]string{
@@ -87,6 +97,7 @@ var Titles = map[string]string{
 	"sqm": "SQM tuner (shaping sweep)", "qos": "QoS priority under load (EF vs best effort)",
 	"mix": "Traffic mix (simulated calls, browsing, streaming and transfers)", "capacity-voice": "Call capacity: voice",
 	"capacity-video": "Call capacity: video",
+	"cdp-up":         "CDP replication (this side is the source)", "cdp-down": "CDP replication (the other side is the source)",
 }
 
 // NewRunID returns a random run ID.
@@ -111,6 +122,13 @@ func (o Options) TestList() ([]string, error) {
 	}
 	var out []string
 	for _, t := range tests {
+		if IsGroup(t) {
+			if err := checkGroup(t); err != nil {
+				return nil, err
+			}
+			out = append(out, t)
+			continue
+		}
 		if !slices.Contains(AllTests, t) {
 			return nil, fmt.Errorf("unknown test %q (available: %s)", t, strings.Join(AllTests, ", "))
 		}
@@ -173,46 +191,17 @@ func Run(ctx context.Context, c *Client, o Options) (*results.Report, error) {
 	}
 	st := &state{tcpMbps: map[results.Direction]float64{}}
 	o.Progress(Event{Type: "run_start", RunID: rep.ID, Total: len(tests), Data: tests})
+	groups := 0
 	for i, t := range tests {
 		if ctx.Err() != nil {
 			break
 		}
-		step := results.Step{ID: fmt.Sprintf("s%02d-%s", i+1, t), Test: testKind(t), Title: Titles[t], StartedAt: time.Now().UTC()}
-		o.Progress(Event{Type: "step_start", RunID: rep.ID, Step: step.ID, Test: t, Title: step.Title, Index: i + 1, Total: len(tests)})
-		progress := func(data any) {
-			o.Progress(Event{Type: "progress", RunID: rep.ID, Step: step.ID, Test: t, Data: data})
-		}
-		res, err := runOne(ctx, c, t, o, st, rep, progress)
-		step.Seconds = math.Round(time.Since(step.StartedAt).Seconds()*10) / 10
-		switch {
-		case err != nil:
-			step.Status, step.Error = "error", err.Error()
-		case res == nil:
-			step.Status = "skipped"
-		default:
-			step.Status, step.Result = "ok", res
-		}
-		// trace/mtr return both directions as two steps.
-		if pair, ok := res.([2]*results.Trace); ok {
-			for j, tr := range pair {
-				s := step
-				s.ID = fmt.Sprintf("%s-%s", step.ID, []string{"fwd", "rev"}[j])
-				if tr == nil {
-					s.Status, s.Result = "error", nil
-					s.Title = step.Title + " - " + []string{"outbound", "return"}[j]
-					if s.Error == "" {
-						s.Error = "no result"
-					}
-				} else {
-					s.Status, s.Error, s.Result = "ok", "", tr
-					s.Title = step.Title + " - " + map[results.Direction]string{results.Up: "outbound", results.Down: "return"}[tr.Direction]
-				}
-				rep.Steps = append(rep.Steps, s)
-			}
+		if IsGroup(t) {
+			groups++
+			runGroup(ctx, c, t, fmt.Sprintf("g%d", groups), o, st, rep, i+1, len(tests))
 		} else {
-			rep.Steps = append(rep.Steps, step)
+			rep.Steps = append(rep.Steps, runStep(ctx, c, t, o, st, rep, i+1, len(tests), "")...)
 		}
-		o.Progress(Event{Type: "step_done", RunID: rep.ID, Step: step.ID, Test: t, Title: step.Title, Index: i + 1, Total: len(tests), Status: step.Status, Error: step.Error, Seconds: step.Seconds, Data: step.Result})
 		sleepCtx(ctx, 500*time.Millisecond)
 	}
 	rep.EndedAt = time.Now().UTC()
@@ -239,6 +228,8 @@ func testKind(t string) string {
 		return "voip"
 	case strings.HasPrefix(t, "capacity-"):
 		return "capacity"
+	case strings.HasPrefix(t, "cdp-"):
+		return "cdp"
 	case t == "mtr":
 		return "trace"
 	}
@@ -252,7 +243,35 @@ func dirOf(t string) results.Direction {
 	return results.Down
 }
 
+// part is one of n phases of a test: outside a group it is scaled(o, d);
+// in a group the group duration is shared across the test's n phases, so
+// a multi-phase test (a rate sweep, bufferbloat) takes about as long as
+// the group's other tests instead of n times as long.
+func part(o Options, d time.Duration, n float64) time.Duration {
+	if o.groupDur > 0 {
+		return max(time.Duration(float64(o.groupDur)/n), time.Second)
+	}
+	return scaled(o, d)
+}
+
+// tcpPart is tcpDuration for one of n phases (see part).
+func tcpPart(o Options, st *state, base time.Duration, n float64) (d, omit time.Duration) {
+	if o.groupDur == 0 {
+		return tcpDuration(o, st, base)
+	}
+	d = part(o, base, n)
+	if st.rttMs > 0 {
+		need := time.Duration(40 * st.rttMs * float64(time.Millisecond))
+		d = max(d, min(need, 30*time.Second))
+	}
+	omit = max(d/5, time.Duration(8*st.rttMs*float64(time.Millisecond)))
+	return d, min(omit, d/3)
+}
+
 func scaled(o Options, d time.Duration) time.Duration {
+	if o.groupDur > 0 {
+		return o.groupDur // every timed test in a group runs for the group duration
+	}
 	return time.Duration(float64(d) * o.Scale)
 }
 
@@ -322,7 +341,7 @@ func runOne(ctx context.Context, c *Client, t string, o Options, st *state, rep 
 		}
 		return r, err
 	case "streams-down", "streams-up":
-		d, _ := tcpDuration(o, st, 5*time.Second)
+		d, _ := tcpPart(o, st, 5*time.Second, 5)
 		return RunStreams(ctx, c, dirOf(t), []int{1, 2, 4, 8, 16}, d, "", live)
 	case "udp-down", "udp-up":
 		dir := dirOf(t)
@@ -333,12 +352,13 @@ func runOne(ctx context.Context, c *Client, t string, o Options, st *state, rep 
 		rate = math.Max(1e6, math.Min(rate, rateCap(o, st, dir)))
 		return RunUDP(ctx, c, UDPParams{Direction: dir, RateBps: rate, Size: 1200, Duration: scaled(o, 10*time.Second), TOS: -1}, st.trustOWD)
 	case "bufferbloat":
-		phase, _ := tcpDuration(o, st, 10*time.Second)
+		// Idle, then three loaded phases: in a group, 1/7 + 3 × 2/7.
+		phase, _ := tcpPart(o, st, 10*time.Second, 3.5)
 		streams := 4
 		if st.rttMs > 100 {
 			streams = 8 // long paths need more flows to fill the link quickly
 		}
-		return RunBufferbloat(ctx, c, BloatParams{Idle: scaled(o, 5*time.Second), Phase: phase, Streams: streams,
+		return RunBufferbloat(ctx, c, BloatParams{Idle: part(o, 5*time.Second, 7), Phase: phase, Streams: streams,
 			OnSample: func(ph string, tt, rtt float64) {
 				progress(map[string]any{"kind": "latency", "phase": ph, "t": tt, "rtt_ms": math.Round(rtt*100) / 100})
 			},
@@ -350,7 +370,7 @@ func runOne(ctx context.Context, c *Client, t string, o Options, st *state, rep 
 			maxRate = 100e6
 		}
 		maxRate = math.Min(maxRate, rateCap(o, st, dir))
-		return RunSweep(ctx, c, SweepParams{Direction: dir, MaxBps: maxRate, Steps: 10, StepTime: scaled(o, 3*time.Second), Size: 1200,
+		return RunSweep(ctx, c, SweepParams{Direction: dir, MaxBps: maxRate, Steps: 10, StepTime: part(o, 3*time.Second, 10), Size: 1200,
 			OnStep: func(s results.SweepStep) { progress(map[string]any{"kind": "sweep", "step": s}) }})
 	case "sizesweep-up", "sizesweep-down":
 		dir := dirOf(t)
@@ -359,7 +379,7 @@ func runOne(ctx context.Context, c *Client, t string, o Options, st *state, rep 
 			rate = math.Min(m*0.3*1e6, 200e6)
 		}
 		rate = math.Max(1e6, math.Min(rate, rateCap(o, st, dir)))
-		return RunSizeSweep(ctx, c, dir, rate, nil, scaled(o, 2*time.Second))
+		return RunSizeSweep(ctx, c, dir, rate, nil, part(o, 2*time.Second, 7))
 	case "pmtu":
 		return RunPMTU(ctx, c)
 	case "integrity":
@@ -369,18 +389,19 @@ func runOne(ctx context.Context, c *Client, t string, o Options, st *state, rep 
 	case "voip-loaded":
 		return RunVoIP(ctx, c, VoIPParams{Duration: scaled(o, 15*time.Second), Load: true})
 	case "cc":
-		d, _ := tcpDuration(o, st, 8*time.Second)
-		return RunCC(ctx, c, LocalCongestionAlgorithms(), d)
+		algs := LocalCongestionAlgorithms()
+		d, _ := tcpPart(o, st, 8*time.Second, float64(max(len(algs), 1)))
+		return RunCC(ctx, c, algs, d)
 	case "shortflow":
 		return RunShortFlows(ctx, c, 10)
 	case "discrimination":
-		d, _ := tcpDuration(o, st, 6*time.Second)
+		d, _ := tcpPart(o, st, 6*time.Second, 3)
 		return RunDiscrimination(ctx, c, results.Down, d)
 	case "qos":
-		d, _ := tcpDuration(o, st, 10*time.Second)
-		return RunQoS(ctx, c, scaled(o, 5*time.Second), d, 4)
+		d, _ := tcpPart(o, st, 10*time.Second, 2)
+		return RunQoS(ctx, c, part(o, 5*time.Second, 2), d, 4)
 	case "mix":
-		return RunMix(ctx, c, MixParams{Spec: o.Mix, Phase: max(scaled(o, 30*time.Second), 10*time.Second),
+		return RunMix(ctx, c, MixParams{Spec: o.Mix, Phase: max(part(o, 30*time.Second, 2), 10*time.Second),
 			RateCap: realtimeCap(o, st), DSCP: !o.NoDSCP, OnRTT: mixLive(progress)})
 	case "capacity-voice", "capacity-video":
 		return RunCapacity(ctx, c, CapacityParams{Kind: strings.TrimPrefix(t, "capacity-"), Step: max(scaled(o, 8*time.Second), 4*time.Second),
@@ -388,6 +409,33 @@ func runOne(ctx context.Context, c *Client, t string, o Options, st *state, rep 
 			OnStep: func(search string, s results.CapacityStep) {
 				progress(map[string]any{"kind": "capacity", "search": search, "step": s})
 			}})
+	case "cdp-up", "cdp-down":
+		dir := dirOf(t)
+		set := o.CDP
+		auto := false
+		if set.RateMbps <= 0 {
+			// No rate given: half of what TCP measured, so the test shows
+			// bursts against the link's real capacity.
+			set.RateMbps, auto = 20, true
+			if m := st.tcpMbps[dir]; m > 0 {
+				set.RateMbps = math.Round(m*0.5*10) / 10
+			}
+		}
+		switch {
+		case o.groupDur > 0:
+			set.DurationS = o.groupDur.Seconds()
+		case set.DurationS <= 0:
+			set.DurationS = math.Max(20, scaled(o, 60*time.Second).Seconds())
+		}
+		if limit := rateCap(o, st, dir); cdpPeakBps(set) > limit {
+			return nil, fmt.Errorf("CDP bursts reach %.0f Mbit/s, above the %.0f Mbit/s this run may use: lower the CDP rate or burst factor, or set a throttle (on the command line: --cdp-rate, --cdp-burst, --cdp-limit)", cdpPeakBps(set)/1e6, limit/1e6)
+		}
+		r, err := RunCDP(ctx, c, CDPParams{Direction: dir, Settings: set, OnInterval: live})
+		if r != nil && auto {
+			r.AutoRate = true
+			r.Notes = append(r.Notes, "No change rate was given, so the test used half the measured TCP throughput. Set the rate your VMs change data at (after compression) for a sizing answer.")
+		}
+		return r, err
 	case "sqm":
 		if o.SQM == nil {
 			return nil, fmt.Errorf("the SQM tuner needs local shaping permission (run with --allow-shaping as root or via the agent service)")

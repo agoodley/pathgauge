@@ -80,6 +80,12 @@ export interface RunOptions {
   mix?: string;
   /** Simulated calls sent without DSCP markings (mix and capacity tests). */
   no_dscp?: boolean;
+  /** Settings for the cdp-up and cdp-down tests. */
+  cdp?: CDPSettings | null;
+  /** How long each test in a group ("a+b" entry in tests) runs; 0: 30 s × scale, at least 15 s. */
+  group_duration_s?: number;
+  /** Grouped tests don't run on their own first. */
+  no_baseline?: boolean;
   client_name?: string;
   server_name?: string;
   imported?: boolean;
@@ -301,6 +307,10 @@ export interface Step {
   started_at: string;
   seconds: number;
   result?: unknown;
+  /** Set for tests run in a group (g1, g2, …). */
+  group?: string;
+  /** "alone": the baseline run on its own; "together": alongside the group's other tests. */
+  phase?: 'alone' | 'together' | string;
 }
 
 export interface Finding {
@@ -347,6 +357,35 @@ export interface Report {
   summary: Summary;
   notes?: string[];
   labels: { client: string; endpoint: string };
+  /** Sets of tests run at the same time ("a+b" entries in the test list). */
+  groups?: TestGroup[] | null;
+  /** Each grouped test's key results on its own and together. */
+  load_comparisons?: LoadComparison[] | null;
+}
+
+export interface TestGroup {
+  /** g1, g2, … */
+  id: string;
+  tests: string[];
+  duration_s: number;
+  /** Each test also ran on its own first. */
+  baseline: boolean;
+}
+
+export interface LoadComparison {
+  group: string;
+  test: string;
+  title: string;
+  /** Tests that ran alongside. */
+  others: string[] | null;
+  metric: string;
+  /** "", "%", "ms", "s", "Mbit/s" */
+  unit: string;
+  alone: number;
+  together: number;
+  better: 'higher' | 'lower';
+  /** Noticeably worse together. */
+  worse: boolean;
 }
 
 export interface Clock {
@@ -803,6 +842,72 @@ export interface CapacityResult {
   step_s: number;
   alone: CapacitySearch;
   with_transfers?: CapacitySearch | null;
+}
+
+/**
+ * Simulated CDP replication (results.CDPSettings). In a run request zero
+ * or absent means the default; in a result the defaults are filled in
+ * (limit_mbps stays absent when there was no throttle).
+ */
+export interface CDPSettings {
+  /** Average changed data on the wire (after compression), Mbit/s. */
+  rate_mbps?: number;
+  /** Write bursts as a multiple of the average. */
+  burst_factor?: number;
+  burst_s?: number;
+  /** Time from one burst to the next. */
+  period_s?: number;
+  /** Replication throttle. */
+  limit_mbps?: number;
+  /** TCP connections. */
+  streams?: number;
+  /** Target RPO. */
+  rpo_s?: number;
+  duration_s?: number;
+}
+
+/** One second of a CDP run. */
+export interface CDPPoint {
+  t: number;
+  /** Worst lag during the second. */
+  lag_s: number;
+  /** Changed data produced. */
+  gen_mbps: number;
+  /** Changed data sent. */
+  sent_mbps: number;
+}
+
+export interface CDPResult {
+  /** up: this agent was the CDP source; down: the server side was. */
+  direction: string;
+  /** As run, defaults filled in. */
+  settings: CDPSettings;
+  /** No rate was given: half the measured TCP rate (or 20 Mbit/s). */
+  auto_rate?: boolean;
+  /** Rate between bursts. */
+  base_mbps: number;
+  /** Rate during bursts. */
+  peak_mbps: number;
+  generated_mb: number;
+  sent_mb: number;
+  throughput_mbps: number;
+  /** What the path carried while changes waited (0 when nothing waited). */
+  sustained_mbps: number;
+  backlogged: boolean;
+  max_lag_s: number;
+  p95_lag_s: number;
+  mean_lag_s: number;
+  end_lag_s: number;
+  within_rpo_pct: number;
+  /** Time the lag exceeded the RPO. */
+  over_rpo_s: number;
+  retrans_pct: number;
+  idle_rtt_ms: StatSummary;
+  /** Latency probes while replication ran. */
+  loaded_rtt_ms: StatSummary;
+  points: CDPPoint[] | null;
+  verdict: MixVerdict;
+  notes?: string[] | null;
 }
 
 // ---- live (internal/engine Event, internal/server hub) ----

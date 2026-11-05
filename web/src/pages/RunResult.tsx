@@ -1,11 +1,13 @@
 import { useState, type FormEvent, type MouseEvent } from 'react';
 import { api, errorMessage, reportURL } from '../lib/api';
 import { useCan } from '../lib/auth';
+import { formatCDP } from '../lib/cdp';
+import { loadVal, phaseText } from '../lib/groups';
 import { gradeLabel, runStatusInfo, severity } from '../lib/domain';
 import { between, f0, f2, fmtDuration, fmtMbps, fmtMs, fmtPct, fmtTime } from '../lib/format';
 import { Link, navigate } from '../lib/router';
 import type { Finding, Report, Run } from '../lib/types';
-import { Badge, Button, Card, CodeLine, ConfirmButton, Empty, ErrorBox, Field, KV, LinkButton, Modal, Notice, PageHeader, ScoreBadge, Tile, toast } from '../components/ui';
+import { Badge, Button, Card, CodeLine, ConfirmButton, DataTable, Empty, ErrorBox, Field, KV, LinkButton, Modal, Notice, PageHeader, ScoreBadge, Tile, toast } from '../components/ui';
 import { StepSection } from '../components/StepResult';
 import { profileLabel } from '../components/shared';
 
@@ -34,6 +36,9 @@ export function RunResult({ run }: { run: Run }) {
     else if (o.profile) q.set('profile', o.profile);
     if (o.mix) q.set('mix', o.mix);
     if (o.no_dscp) q.set('dscp', '0');
+    if (o.cdp && formatCDP(o.cdp)) q.set('cdp', formatCDP(o.cdp));
+    if (o.group_duration_s) q.set('gdur', String(o.group_duration_s));
+    if (o.no_baseline) q.set('baseline', '0');
     navigate(`/runs/new?${q.toString()}`);
   };
 
@@ -183,6 +188,8 @@ function ReportView({ rep, profile }: { rep: Report; profile: string }) {
         {findings.length === 0 ? <Empty>No findings.</Empty> : findings.map((f, i) => <FindingCard key={f.id + i} f={f} />)}
       </Card>
 
+      <LoadSection rep={rep} />
+
       <h2 className="section-title">Results by step</h2>
       {steps.length === 0 && <Empty>No steps recorded.</Empty>}
       <nav className="step-index" aria-label="Steps">
@@ -190,11 +197,12 @@ function ReportView({ rep, profile }: { rep: Report; profile: string }) {
           <a key={x.id} href={`#step-${x.id}`} onClick={(e) => scrollToStep(e, x.id)} className={x.status !== 'ok' ? 'step-index-err' : undefined}>
             {x.status !== 'ok' && <span aria-hidden="true">✖ </span>}
             {x.title}
+            {x.phase && <span className="step-index-phase"> · {x.phase === 'alone' ? 'on its own' : 'together'}</span>}
           </a>
         ))}
       </nav>
       {steps.map((x) => (
-        <StepSection key={x.id} step={x} />
+        <StepSection key={x.id} step={x} phase={phaseText(rep, x)} />
       ))}
 
       <Card title="Methodology">
@@ -219,6 +227,78 @@ function ReportView({ rep, profile }: { rep: Report; profile: string }) {
         />
       </Card>
     </>
+  );
+}
+
+/**
+ * Tests run together (groups): each key result on its own and together,
+ * as loadSection in internal/report/mix.go. No chart: the measures have
+ * different units, so it would be one small chart per measure with two
+ * bars, which says less than the table.
+ */
+function LoadSection({ rep }: { rep: Report }) {
+  const groups = rep.groups ?? [];
+  if (!groups.length) return null;
+  const cmp = rep.load_comparisons ?? [];
+  const steps = rep.steps ?? [];
+  // The step of a grouped test in a phase, to link its value to.
+  const stepOf = (group: string, phase: string, test: string) =>
+    steps.find((s) => s.group === group && s.phase === phase && (s.id.endsWith(`-${test}`) || s.id.endsWith(`-${test}-fwd`)));
+  const link = (group: string, phase: string, test: string, text: string) => {
+    const s = stepOf(group, phase, test);
+    return s ? (
+      <a href={`#step-${s.id}`} onClick={(e) => scrollToStep(e, s.id)}>
+        {text}
+      </a>
+    ) : (
+      text
+    );
+  };
+  return (
+    <Card title="Under load: tests run together" id="under-load">
+      {groups.map((g) => {
+        const rows = cmp.filter((c) => c.group === g.id);
+        const compared = new Set(rows.map((c) => c.test));
+        const missing = g.baseline ? g.tests.filter((t) => !compared.has(t)) : [];
+        return (
+          <div key={g.id} className="load-group">
+            {groups.length > 1 && <h3>Group {g.id.replace(/^g/, '')}</h3>}
+            <p>
+              {g.tests.map((t, i) => (
+                <span key={t}>
+                  {i > 0 && ' + '}
+                  <code>{t}</code>
+                </span>
+              ))}{' '}
+              ran at the same time, each for {f0(g.duration_s)} s.{' '}
+              {g.baseline ? 'Each first ran on its own for the same time.' : 'They didn’t run on their own first, so there is nothing to compare with.'}
+            </p>
+            {rows.length > 0 && (
+              <div className="load-table">
+                <DataTable
+                  head={['Test', 'Measure', 'On its own', 'Together', 'Change']}
+                  numeric={[2, 3]}
+                  rows={rows.map((c) => [
+                    <>
+                      {c.title} <code className="small muted">{c.test}</code>
+                    </>,
+                    c.metric,
+                    link(g.id, 'alone', c.test, loadVal(c.alone, c.unit)),
+                    link(g.id, 'together', c.test, loadVal(c.together, c.unit)),
+                    c.worse ? <Badge kind="warning" icon="▲" label="Worse" /> : <Badge kind="good" icon="✔" label="Similar" />,
+                  ])}
+                />
+              </div>
+            )}
+            {missing.length > 0 && (
+              <p className="muted small">
+                Not compared: {missing.join(', ')} (no key result to compare, or a step didn’t finish).
+              </p>
+            )}
+          </div>
+        );
+      })}
+    </Card>
   );
 }
 

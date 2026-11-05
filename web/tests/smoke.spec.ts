@@ -1,6 +1,8 @@
 // Browser smoke test: sign in, visit every page, open a run result,
-// compare runs, start a short custom run and watch it finish, check dark
-// mode, and fail on any console error. Screenshots go to $SHOTS.
+// compare runs, check the traffic-mix and CDP options, run a short CDP
+// test and a short group of tests run together, start a short custom run
+// and watch it finish, check dark mode, and fail on any console error.
+// Screenshots go to $SHOTS.
 import { expect, request, test, type Page } from '@playwright/test';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -139,6 +141,83 @@ test('dashboard smoke test', async ({ page }) => {
       await expect(page.getByRole('heading', { name: 'On their own' }).first()).toBeVisible();
     }
     await shot(page, '25-mix-result');
+  });
+
+  await test.step('CDP replication options, a short run and its result', async () => {
+    const a = (await (await page.request.get(`/api/agents/${agent!.id}`)).json()) as AgentJSON;
+    expect(a.online && !a.busy, `${a.name} must be online and idle to start a run`).toBeTruthy();
+    await page.goto(`/runs/new?agent=${a.id}&tests=cdp-up`);
+    await settled(page);
+    await expect(page.getByLabel(/^CDP replication, agent to server/)).toBeChecked();
+    await expect(page.getByRole('heading', { name: '3. CDP replication' })).toBeVisible();
+    // Defaults show as placeholders; the readout follows the settings.
+    await expect(page.getByLabel(/^Burst factor/)).toHaveAttribute('placeholder', '3');
+    await page.getByLabel(/^Change rate/).fill('50');
+    await page.getByLabel(/^Burst length/).fill('2');
+    await page.getByLabel(/^Burst period/).fill('8');
+    await page.getByLabel(/^Duration/).fill('6');
+    await expect(page.locator('.cdp-rates')).toContainText('16.7 Mbit/s between bursts and 150 Mbit/s during 2 s bursts every 8 s');
+    // Bursts above the max rate warn; invalid settings block the start.
+    await page.getByLabel(/^Max rate/).fill('100');
+    await expect(page.getByText(/Bursts reach 150 Mbit\/s, above the 100 Mbit\/s max rate/)).toBeVisible();
+    await page.getByLabel(/^Max rate/).fill('');
+    await page.getByLabel(/^TCP connections/).fill('500');
+    await expect(page.getByRole('button', { name: 'Start run' })).toBeDisabled();
+    await page.getByLabel(/^TCP connections/).fill('');
+    await shot(page, '26-new-run-cdp');
+
+    // Run it (a few seconds), check the result, then "Run again" keeps the settings.
+    await page.getByRole('button', { name: 'Start run' }).click();
+    await expect(page).toHaveURL(/\/runs\/[0-9a-f]+$/);
+    await expect(page.getByRole('heading', { name: 'Results by step' })).toBeVisible({ timeout: RUN_TIMEOUT });
+    await settled(page);
+    const step = page.locator('section.step').first();
+    await expect(step.getByText('This agent was the CDP source, replicating to the server.')).toBeVisible();
+    await expect(step.getByText('Replication lag (the RPO the replica had) against the target')).toBeVisible();
+    await expect(step.getByText('Changed data produced and sent, per second')).toBeVisible();
+    await expect(step.locator('.tile-label', { hasText: 'Time within the RPO' })).toBeVisible();
+    await shot(page, '27-cdp-result');
+    await page.getByRole('button', { name: 'Run again' }).click();
+    await expect(page).toHaveURL(/[?&]cdp=/);
+    await settled(page);
+    await expect(page.getByLabel(/^Change rate/)).toHaveValue('50');
+    await expect(page.getByLabel(/^Duration/)).toHaveValue('6');
+  });
+
+  await test.step('run tests together: build a group, run it, read the comparison', async () => {
+    const a = (await (await page.request.get(`/api/agents/${agent!.id}`)).json()) as AgentJSON;
+    expect(a.online && !a.busy, `${a.name} must be online and idle to start a run`).toBeTruthy();
+    await page.goto(`/runs/new?agent=${a.id}&tests=info`);
+    await settled(page);
+    await page.getByRole('button', { name: 'Add a group' }).click();
+    const add = page.getByLabel('Add a test to group 1');
+    // Tests that can't share the path are listed but disabled.
+    await expect(add.locator('option[value="sqm"]')).toBeDisabled();
+    await add.selectOption('latency');
+    await expect(page.getByText(/Add at least one more test/)).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Start run' })).toBeDisabled();
+    await add.selectOption('voip');
+    await expect(page.getByRole('list', { name: 'Tests in group 1' }).getByRole('listitem')).toHaveCount(2);
+    await page.getByLabel(/^Group duration/).fill('5');
+    await expect(page.locator('section.together')).toContainText('each test on its own for 5 s, then all 2 together for 5 s');
+    await expect(page.getByText('1 test + 1 group run together')).toBeVisible();
+    await shot(page, '28-new-run-group');
+
+    await page.getByRole('button', { name: 'Start run' }).click();
+    await expect(page).toHaveURL(/\/runs\/[0-9a-f]+$/);
+    await expect(page.getByRole('heading', { name: 'Results by step' })).toBeVisible({ timeout: RUN_TIMEOUT });
+    await settled(page);
+    const load = page.locator('#under-load');
+    await expect(load).toContainText('ran at the same time, each for 5 s');
+    await expect(load.getByRole('row')).toHaveCount(4); // header, latency (2 measures), voice
+    await expect(page.getByRole('heading', { name: /^Voice call simulation \(on its own, for comparison\)/ })).toBeVisible();
+    await expect(page.getByRole('heading', { name: /^Voice call simulation \(together with latency\)/ })).toBeVisible();
+    await shot(page, '29-group-result');
+    // Run again keeps the group and its duration.
+    await page.getByRole('button', { name: 'Run again' }).click();
+    await settled(page);
+    await expect(page.getByRole('list', { name: 'Tests in group 1' }).getByRole('listitem')).toHaveCount(2);
+    await expect(page.getByLabel(/^Group duration/)).toHaveValue('5');
   });
 
   await test.step('create, use and delete things', async () => {

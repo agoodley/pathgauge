@@ -223,3 +223,22 @@ func TestDashboardMixCatalogueMatches(t *testing.T) {
 		t.Error("MAX_RT_SESSIONS differs from maxRTSessions")
 	}
 }
+
+func TestLoopbackCDPBothDirections(t *testing.T) {
+	if testing.Short() {
+		t.Skip("runs for ~12 s")
+	}
+	c := dial(t, startEndpoint(t))
+	for _, dir := range []results.Direction{results.Up, results.Down} {
+		r, err := RunCDP(context.Background(), c, CDPParams{Direction: dir, Settings: results.CDPSettings{RateMbps: 80, BurstS: 1, PeriodS: 2, DurationS: 4}})
+		if err != nil {
+			t.Fatalf("%s: %v", dir, err)
+		}
+		if r.Verdict != "good" || r.SentMB <= 0 || len(r.Points) < 3 || r.Settings.Streams != 4 || r.Settings.RPOs != 15 {
+			t.Errorf("%s: %+v", dir, r)
+		}
+		if r.IdleRTT.N == 0 || r.LoadedRTT.N == 0 {
+			t.Errorf("%s: latency probes missing", dir)
+		}
+	}
+}
