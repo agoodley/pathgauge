@@ -49,18 +49,19 @@ run() { # run NAME: call scenario_NAME and record the outcome
 # --- scenarios -------------------------------------------------------------
 
 scenario_clean() {
-    # A healthy 500 Mbit/s path with a well-managed queue. Without a rate
+    # A healthy 150 Mbit/s path with a well-managed queue. Without a rate
     # limit the lab is CPU-bound and one stream gets an erratic share of
-    # the forwarding CPU, which reads as a per-flow cap.
-    lab impair a2b --delay 5ms --rate 500mbit --qdisc fq_codel
-    lab impair b2a --delay 5ms --rate 500mbit --qdisc fq_codel
+    # the forwarding CPU, which reads as a per-flow cap; the rate is kept
+    # well below what a 4-CPU CI runner can forward (~230 Mbit/s).
+    lab impair a2b --delay 5ms --rate 150mbit --qdisc fq_codel
+    lab impair b2a --delay 5ms --rate 150mbit --qdisc fq_codel
     client clean --tests info,latency,trace,tcp-down,tcp-up,tcp-down-1,tcp-up-1,pmtu,integrity --scale 0.5 || return 1
     check clean 'steps_ok()' \
         'approx(res("latency")["udp_rtt_ms"]["median"], 10, 15)' \
         'res("latency")["loss"]["loss_pct"] == 0' \
         'len(res("trace", "up")["hops"]) == 3 and res("trace", "up")["reached"]' \
         'len(res("trace", "down")["hops"]) == 3' \
-        'res("tcp", "down", 8)["mbps"] > 300 and res("tcp", "up", 8)["mbps"] > 300' \
+        'res("tcp", "down", 8)["mbps"] > 110 and res("tcp", "up", 8)["mbps"] > 110' \
         'res("pmtu")["up"]["mtu"] == 1500 and res("pmtu")["down"]["mtu"] == 1500' \
         'not res("pmtu")["up"]["blackhole"] and not res("pmtu")["down"]["blackhole"]' \
         'all(d["status"] == "preserved" for d in res("integrity")["dscp_up"] + res("integrity")["dscp_down"])' \

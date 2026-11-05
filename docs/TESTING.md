@@ -40,7 +40,7 @@ The lab (`lab/netns.sh`) has two endpoints with two routers between them. Delay,
 
 | Scenario | Fault built | Main checks |
 |---|---|---|
-| clean | 5 ms each way, 500 Mbit/s fq_codel bottleneck | RTT 10 ms ±15%, 3 hops both ways, path MTU 1500, every DSCP and ECN mark preserved, no NAT, 2 hops from TTL, no warnings |
+| clean | 5 ms each way, 150 Mbit/s fq_codel bottleneck | RTT 10 ms ±15%, 3 hops both ways, path MTU 1500, every DSCP and ECN mark preserved, no NAT, 2 hops from TTL, no warnings |
 | bufferbloat | 50/10 Mbit/s tbf, 300/500 ms FIFO buffers | Download 47.8 Mbit/s ±6% **and within 5% of iperf3**, upload 9.5 ±8%, grades ≥ C and ≥ D, FIFO queue, sweep signature "bufferbloat" |
 | cake | the same rates with CAKE | Grade A or better, flow-queued, "latency stays low" finding |
 | policer | 30 Mbit/s policer | Sweep signature "policer", capacity 30 ±15%, queue < 5 ms |
