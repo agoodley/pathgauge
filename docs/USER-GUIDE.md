@@ -72,7 +72,7 @@ pathgauge test boxA.example.com --key pg_... --profile standard --html report.ht
 |---|---|---|
 | `quick` | latency, TCP both ways, bufferbloat | ~1 min |
 | `standard` | adds path both ways, single-stream TCP, UDP loss and jitter, PMTU, middlebox checks, voice | ~4 min |
-| `full` | adds stream scaling, rate sweeps, packet-size sweep, congestion control, short flows, throttling checks, MTR | ~12 min |
+| `full` | adds stream scaling, rate sweeps, packet-size sweep, congestion control, short flows, throttling checks, MTR and the `office` traffic mix | ~14 min |
 
 ### Useful options
 
@@ -209,7 +209,51 @@ Safety guarantees:
 
 ---
 
-## 7. Monitoring, alerts and schedules
+## 7. Traffic mix and call capacity
+
+The `mix` test answers "what would it be like to use this link?". It runs simulated application sessions at the same time and grades each one:
+
+| Kind | What it sends | Graded on |
+|---|---|---|
+| `voice`, `voice-opus` | A call: 20 ms packets both ways (G.711 or Opus), marked EF | MOS (ITU-T E-model) after an adaptive jitter buffer |
+| `video`, `video-hd` | A video call at 1.5 or 3.8 Mbit/s both ways: 30 frames/s, a keyframe every 2 s, paced like WebRTC, marked AF41 | Frames shown on time, freezes, and added latency |
+| `gaming` | 60 small packets/s both ways | Added delay (p95) and loss |
+| `web` | Page loads: an 80 KB document, then six 320 KB objects in parallel, every 5 s | Page-load time (p95) |
+| `stream`, `stream-4k` | Video on demand: a 4 s chunk at 5 or 16 Mbit/s every 4 s | Chunk download time against play time (over 100% means rebuffering) |
+| `download`, `upload` | A bulk TCP transfer for the whole phase | Throughput (not graded) |
+
+Each call and game uses its own UDP port, so queues that separate flows (fq_codel, CAKE, per-flow policers) treat it like the real application. When the mix includes transfers it runs twice, **first without them and then with them**, so the results show what the transfers do to everything else, for example "voice calls drop from MOS 4.4 to 2.3 while file transfers run".
+
+Choose the mix with `--mix` (or on the dashboard's New run page):
+
+```bash
+pathgauge test boxA --key pg_... --mix office                              # a named scenario
+pathgauge test boxA --key pg_... --mix "voice:10,video:2,web:3,upload:1"   # your own
+pathgauge test boxA --key pg_... --tests mix --mix family --no-dscp        # calls unmarked
+```
+
+| Scenario | Sessions |
+|---|---|
+| `office` (default) | 10 voice calls, 3 video calls, 5 web users, 1 download, 1 upload |
+| `home-working` | 1 video call, 1 web user, 1 HD stream, 1 upload |
+| `call-centre` | 30 voice calls, 5 web users, 1 download |
+| `family` | 1 video call, 2 HD streams, 1 game, 2 web users, 1 download |
+
+`--mix` on its own runs just the mix (each phase lasts 30 s × `--scale`). The `full` profile includes the mix with the `office` scenario.
+
+**Call capacity.** `capacity-voice` and `capacity-video` find how many simultaneous calls the path carries: they double the number of calls until one turns poor, then narrow the gap, first on their own and then while a download and an upload run. A typical answer: "48 voice calls on their own, 0 while transfers run", which says the bottleneck queue needs managing. The search stops at the run's rate cap (`--max-rate`) or at 256 voice or 64 video calls.
+
+**How calls are graded.** The jitter buffer is modelled on real call software: it follows recent delay variation, so a steady queue becomes extra delay rather than lost audio, while sudden delay jumps cause a few late packets until it adapts. Video receivers ask for lost packets again, as WebRTC does, and a frame that misses its playout time freezes the picture for as long as it's late. Video verdicts: good is at least 99% of frames on time, no freezes and at most 150 ms of added latency; acceptable is at least 95%, freezes under 2% of the time and at most 300 ms. Voice: MOS 4.0 or more is good and 3.6 or more acceptable.
+
+Limits to keep in mind:
+
+- The traffic copies each application's timing and packet sizes, not its protocol, so equipment that classifies traffic by inspecting packets won't recognise it as Teams or Zoom.
+- Video calls use a fixed bitrate. Real applications lower it when the network is congested, so video results are the worst case for the chosen quality.
+- Scheduled runs use the `office` scenario.
+
+---
+
+## 8. Monitoring, alerts and schedules
 
 - **Monitoring:** each agent sends a latency, jitter and loss sample to the server every minute. You can change the interval per agent or turn it off. Monitoring pauses while a test runs. Samples are kept for 90 days (`retention_days` in `server.yaml`).
 - **Alert metrics:**
@@ -223,7 +267,7 @@ Safety guarantees:
 
 ---
 
-## 8. Command reference
+## 9. Command reference
 
 | Command | Purpose |
 |---|---|
@@ -243,7 +287,7 @@ Safety guarantees:
 
 ---
 
-## 9. Troubleshooting
+## 10. Troubleshooting
 
 - **`connect to endpoint … refused or timed out`:** open 7400/tcp **and** 7400/udp on the endpoint or server (host firewall and any cloud firewall).
 - **Agent shows offline:** check `journalctl -u pathgauge-agent`. A message about a revoked agent means it was removed in the dashboard; enrol it again with a new token.

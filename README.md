@@ -10,6 +10,7 @@ Two-ended network diagnostics for Linux. Install PathGauge on two machines and i
 - **Rate sweeps:** the network's response curve from low load to beyond capacity, classifying the bottleneck as a policer, shaper, bufferbloat, burst allowance or non-congestive loss. Also packet-size sweeps (packets per second limits) and stream-count scaling.
 - **Path:** traceroute and MTR in **both directions at once** (Paris-style when privileged, with MPLS labels), with loss correctly separated from ICMP rate limiting.
 - **Middleboxes:** path MTU and black holes in each direction, MSS clamping, stripped TCP options, DSCP and ECN preservation, NAT and carrier-grade NAT.
+- **Traffic mix:** simulated voice and video calls, gaming, web browsing, video streaming and file transfers running at once, each on its own flow and graded the way users experience it (MOS, frames on time and freezes, page-load and chunk times), with and without bulk transfers. A **call-capacity** search finds how many simultaneous calls the path carries, on their own and while transfers run.
 - **Applications:** a simulated voice call with MOS (idle and under load), QoS priority under load (EF vs best effort), short-transfer times, comparison of congestion-control algorithms, UDP throttling and WAN-optimiser checks.
 - **Traffic shaping:** time-limited shaping with CAKE, fq_codel, tbf or netem, plus an **SQM tuner** that finds the shaping rate that cures bufferbloat.
 - **Diagnosis:** findings with evidence and recommendations, a 0–100 health score, and a one-page link fingerprint.
@@ -67,7 +68,7 @@ sudo pathgauge doctor
 | Packages | `make snapshot` |
 | Install/upgrade/remove on 6 distros (Docker) | `make install-test` |
 | Packaged Rocky 9 server + Rocky 8 agent under systemd (Docker) | `make e2e` |
-| Accuracy: 17 known-fault scenarios in a network-namespace lab (Docker) | `make lab-scenarios` |
+| Accuracy: 21 known-fault scenarios in a network-namespace lab (Docker) | `make lab-scenarios` |
 
 See [docs/TESTING.md](docs/TESTING.md) for what each layer covers and the latest results. [docs/PLAN.md](docs/PLAN.md) has the design and roadmap, and [docs/API.md](docs/API.md) the REST API.
 

@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -124,8 +125,8 @@ type testFlags struct {
 	tests, skip                                                              []string
 	scale, maxRate, expectDown, expectUp                                     float64
 	streams, traceCycles                                                     int
-	noResolve, quiet, noSave, allowShaping                                   bool
-	shapeIface                                                               string
+	noResolve, quiet, noSave, allowShaping, noDSCP                           bool
+	shapeIface, mix                                                          string
 }
 
 func newTestCmd() *cobra.Command {
@@ -172,6 +173,8 @@ Results are saved as JSON (see --json); render them again later with
 	fl.BoolVarP(&f.quiet, "quiet", "q", false, "no live progress")
 	fl.BoolVar(&f.allowShaping, "allow-shaping", false, "allow the sqm test to shape this host's interface temporarily (root or CAP_NET_ADMIN)")
 	fl.StringVar(&f.shapeIface, "shape-interface", "", "interface for the sqm test (default: the route to the endpoint)")
+	fl.StringVar(&f.mix, "mix", "", "traffic mix for the mix test: a scenario ("+strings.Join(mixScenarioList(), ", ")+") or kind:count,... (default "+engine.DefaultMix+")")
+	fl.BoolVar(&f.noDSCP, "no-dscp", false, "send simulated calls without DSCP markings (mix and capacity tests)")
 	return cmd
 }
 
@@ -195,6 +198,15 @@ func runTest(ctx context.Context, out, errOut io.Writer, host string, f testFlag
 		Profile: f.profile, Tests: f.tests, Skip: f.skip, Scale: f.scale, MaxRateMbps: f.maxRate,
 		TraceCycles: f.traceCycles, Resolve: !f.noResolve, Streams: f.streams,
 		Labels: results.LinkLabels{Client: f.clientName, Endpoint: f.endpointName},
+		Mix:    f.mix, NoDSCP: f.noDSCP,
+	}
+	if f.mix != "" {
+		if _, _, err := engine.ParseMix(f.mix); err != nil {
+			return err
+		}
+		if len(f.tests) == 0 {
+			opts.Tests = []string{"info", "mix"} // --mix alone runs just the mix
+		}
 	}
 	if f.allowShaping {
 		opts.SQM = shaping.NewTuner(slog.Default(), f.shapeIface)
@@ -414,4 +426,13 @@ func newEnrichCmd() *cobra.Command {
 	}
 	cmd.AddCommand(update, lookup)
 	return cmd
+}
+
+func mixScenarioList() []string {
+	var n []string
+	for k := range engine.MixScenarios {
+		n = append(n, k)
+	}
+	sort.Strings(n)
+	return n
 }

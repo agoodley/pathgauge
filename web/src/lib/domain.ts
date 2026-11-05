@@ -60,6 +60,22 @@ export function gradeLabel(g: string): { kind: StatusKind; icon: string; label: 
   return { kind: k, icon, label };
 }
 
+/**
+ * Quality verdict of a simulated session, phase or capacity step (traffic
+ * mix and call capacity). Transfers have none.
+ */
+export function verdictInfo(v: string | null | undefined): { kind: StatusKind; icon: string; label: string } {
+  switch (v) {
+    case 'good':
+      return { kind: 'good', icon: '✔', label: 'Good' };
+    case 'acceptable':
+      return { kind: 'warning', icon: '▲', label: 'Acceptable' };
+    case 'poor':
+      return { kind: 'critical', icon: '✖', label: 'Poor' };
+  }
+  return { kind: 'neutral', icon: '–', label: 'No verdict' };
+}
+
 /** Grade order for comparisons: lower index is better. */
 export const gradeOrder = ['A+', 'A', 'B', 'C', 'D', 'F'];
 
@@ -101,6 +117,12 @@ const baseSeconds: Record<string, [scaled: number, fixed: number]> = {
   discrimination: [36, 3],
   sqm: [120, 30],
   qos: [25, 4],
+  // Mix: one or two phases of max(30 s × scale, 10 s). Capacity: two
+  // searches of 6–9 steps of max(8 s × scale, 4 s) each, so the fixed
+  // part is large.
+  mix: [60, 10],
+  'capacity-voice': [120, 50],
+  'capacity-video': [100, 40],
 };
 
 export function estimateSeconds(tests: string[], scale: number): number {

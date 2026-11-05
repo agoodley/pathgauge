@@ -12,6 +12,7 @@ Each EXPR is a Python expression evaluated with these helpers:
   S                                                 the run summary dict
   R                                                 the whole report
   steps_ok()                                        True if every step succeeded
+  mixkind(phase, kind)                              a traffic-mix kind summary in a phase
 Exit status is 1 if any expression is false or fails.
 """
 import json
@@ -67,8 +68,17 @@ def main():
             print("      failed steps: " + "; ".join(bad))
         return not bad
 
+    def mixkind(phase, kind):
+        for p in res("mix")["phases"]:
+            if p["name"] == phase:
+                for k in p["kinds"]:
+                    if k["kind"] == kind:
+                        print(f"      {phase}/{kind}: {k['verdict'] or '-'} {k['metric']} {k['value']} {k['unit']} ({k['good']}/{k['acceptable']}/{k['poor']})")
+                        return k
+        raise LookupError(f"no {kind} in mix phase {phase}")
+
     env = {"res": res, "st": st, "finding": finding, "sev": sev, "approx": approx, "grade_rank": grade_rank,
-           "S": report.get("summary", {}), "R": report, "steps_ok": steps_ok, "len": len, "abs": abs,
+           "S": report.get("summary", {}), "R": report, "steps_ok": steps_ok, "mixkind": mixkind, "len": len, "abs": abs,
            "all": all, "any": any, "min": min, "max": max, "set": set}
     failed = 0
     for e in exprs:

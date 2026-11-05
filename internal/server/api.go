@@ -568,7 +568,18 @@ func (s *Server) apiCompare(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) apiProfiles(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, 200, map[string]any{"profiles": engine.Profiles, "tests": engine.AllTests, "titles": engine.Titles})
+	type mixKind struct {
+		Name  string `json:"name"`
+		Label string `json:"label"`
+		Class string `json:"class"`
+		Max   int    `json:"max"`
+	}
+	var kinds []mixKind
+	for _, k := range engine.MixKinds {
+		kinds = append(kinds, mixKind{k.Name, k.Label, k.Class, k.Max})
+	}
+	writeJSON(w, 200, map[string]any{"profiles": engine.Profiles, "tests": engine.AllTests, "titles": engine.Titles,
+		"mix_kinds": kinds, "mix_scenarios": engine.MixScenarios, "mix_default": engine.DefaultMix})
 }
 
 // ---- overview ----

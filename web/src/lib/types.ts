@@ -76,6 +76,10 @@ export interface RunOptions {
   scale?: number;
   max_rate_mbps?: number;
   streams?: number;
+  /** Traffic mix for the mix test: a scenario name or "kind:count,...". */
+  mix?: string;
+  /** Simulated calls sent without DSCP markings (mix and capacity tests). */
+  no_dscp?: boolean;
   client_name?: string;
   server_name?: string;
   imported?: boolean;
@@ -665,6 +669,140 @@ export interface QoSResult {
   up_mbps: number;
   priority_effective: boolean;
   verdict: string;
+}
+
+/** Quality verdict of a simulated session; empty for transfers (no verdict). */
+export type MixVerdict = 'good' | 'acceptable' | 'poor' | '';
+
+export interface MixCount {
+  kind: string;
+  label: string;
+  count: number;
+}
+
+export interface MixFrames {
+  frames: number;
+  /** Complete and on time. */
+  ok_pct: number;
+  late_pct: number;
+  /** Lost packets repaired by retransmission. */
+  repaired_pct: number;
+  /** Could not be repaired at all. */
+  lost_pct: number;
+  /** Runs of bad frames of 200 ms or more. */
+  freezes: number;
+  freeze_s: number;
+  delay_p50_ms: number;
+  delay_p95_ms: number;
+  /** Mean delay added by queues plus the jitter buffer. */
+  playout_ms: number;
+}
+
+/** One direction of a real-time (voice, video, gaming) session. */
+export interface MixFlow {
+  loss_pct: number;
+  jitter_ms: number;
+  delay_ms: number;
+  added_p50_ms: number;
+  added_p95_ms: number;
+  late_pct?: number;
+  playout_ms?: number;
+  mos?: number;
+  r?: number;
+  frames?: MixFrames | null;
+  verdict: MixVerdict;
+}
+
+export interface MixSession {
+  id: string;
+  kind: string;
+  verdict?: MixVerdict;
+  error?: string;
+  /** Real-time sessions: client to endpoint. */
+  up?: MixFlow | null;
+  /** Real-time sessions: endpoint to client. */
+  down?: MixFlow | null;
+  /** Transfers. */
+  mbps?: number;
+  /** Web page loads or streaming chunk downloads. */
+  times_ms?: StatSummary | null;
+  count?: number;
+  errors?: number;
+  /** Streaming: play time per chunk. */
+  target_ms?: number;
+}
+
+export interface MixKind {
+  kind: string;
+  label: string;
+  sessions: number;
+  good: number;
+  acceptable: number;
+  poor: number;
+  /** Worst session; empty for transfers. */
+  verdict?: MixVerdict;
+  /** What value is, e.g. "worst call quality (MOS)". */
+  metric: string;
+  value: number;
+  unit: string;
+  summary: string;
+}
+
+export interface MixPhase {
+  /** interactive, with-transfers or all */
+  name: string;
+  label: string;
+  with_transfers: boolean;
+  duration_s: number;
+  probe_rtt_ms: StatSummary;
+  kinds: MixKind[] | null;
+  sessions: MixSession[] | null;
+  verdict: MixVerdict;
+}
+
+export interface MixResult {
+  spec: string;
+  scenario?: string;
+  counts: MixCount[] | null;
+  base_rtt_ms: number;
+  dscp: boolean;
+  phases: MixPhase[] | null;
+  verdict: MixVerdict;
+  notes?: string[] | null;
+}
+
+export interface CapacityStep {
+  sessions: number;
+  good: number;
+  acceptable: number;
+  poor: number;
+  /** Worst MOS (voice), frames-on-time % (video) or added delay ms (gaming). */
+  worst: number;
+  loss_pct: number;
+  added_p95_ms: number;
+  verdict: MixVerdict;
+}
+
+export interface CapacitySearch {
+  steps: CapacityStep[] | null;
+  /** Most sessions with every session good. */
+  good: number;
+  /** Most sessions with none poor. */
+  acceptable: number;
+  /** Set when the search stopped before quality dropped. */
+  limit?: number;
+  /** "rate cap" or "session cap". */
+  limit_reason?: string;
+}
+
+export interface CapacityResult {
+  /** voice, video (or another real-time mix kind). */
+  kind: string;
+  label: string;
+  per_session_kbps: number;
+  step_s: number;
+  alone: CapacitySearch;
+  with_transfers?: CapacitySearch | null;
 }
 
 // ---- live (internal/engine Event, internal/server hub) ----

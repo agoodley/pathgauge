@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"sync/atomic"
 	"time"
 
 	"github.com/agoodley/pathgauge/internal/flow"
@@ -19,6 +20,24 @@ type sendEntry struct {
 	done   chan struct{}
 	result flow.UDPSendResult
 	cancel context.CancelFunc
+	peer   atomic.Pointer[net.UDPAddr] // per-stream return address, if punched
+}
+
+// maxStreamPeers bounds per-stream return addresses kept for one session.
+const maxStreamPeers = 4096
+
+// setStreamPeer records the return address for one stream.
+func (ss *session) setStreamPeer(stream uint32, from *net.UDPAddr) {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	if _, ok := ss.peers[stream]; !ok && len(ss.peers) >= maxStreamPeers {
+		return
+	}
+	a := *from
+	ss.peers[stream] = &a
+	if e := ss.sends[stream]; e != nil {
+		e.peer.Store(&a)
+	}
 }
 
 // udpLoop receives every UDP packet: reflects probes, feeds sinks,
@@ -90,7 +109,11 @@ func (s *Server) udpLoop(ctx context.Context) {
 				e.sink.Add(h, n, rx, ri)
 			}
 		case proto.UDPPunch, proto.UDPKeepalive:
-			sess.udpPeer.Store(from)
+			if h.Stream != 0 {
+				sess.setStreamPeer(h.Stream, from)
+			} else {
+				sess.udpPeer.Store(from)
+			}
 		case proto.UDPPMTU:
 			sess.mu.Lock()
 			sess.pmtuSeen = max(sess.pmtuSeen, n)
@@ -115,6 +138,8 @@ func (s *Server) udpLoop(ctx context.Context) {
 // UDPSinkReq registers a receiving stream.
 type UDPSinkReq struct {
 	BinMs int `json:"bin_ms"`
+	// Log keeps a per-packet log and returns it with the result.
+	Log bool `json:"log,omitempty"`
 }
 
 // UDPSinkReady returns the stream ID to send on.
@@ -132,7 +157,11 @@ type UDPSinkResultReq struct {
 func (ss *session) udpSink(r UDPSinkReq) UDPSinkReady {
 	id := ss.allocStreams(1)[0]
 	ss.mu.Lock()
-	ss.sinks[id] = &sinkEntry{sink: flow.NewUDPSink(time.Duration(max(r.BinMs, 10)) * time.Millisecond)}
+	sink := flow.NewUDPSink(time.Duration(max(r.BinMs, 10)) * time.Millisecond)
+	if r.Log {
+		sink.EnableLog()
+	}
+	ss.sinks[id] = &sinkEntry{sink: sink}
 	ss.mu.Unlock()
 	return UDPSinkReady{Stream: id}
 }
@@ -160,6 +189,9 @@ type UDPSendReq struct {
 	Count      uint64  `json:"count,omitempty"`
 	Type       byte    `json:"type,omitempty"`
 	Wait       bool    `json:"wait,omitempty"`
+	// Video, if set, sends frames following this model instead of a
+	// constant-rate stream (RateBps and Size are ignored).
+	Video *flow.VideoModel `json:"video,omitempty"`
 }
 
 func (ss *session) udpSend(r UDPSendReq) (any, error) {
@@ -167,7 +199,14 @@ func (ss *session) udpSend(r UDPSendReq) (any, error) {
 	if peer == nil {
 		return nil, errors.New("no UDP path from the client yet (send a punch first)")
 	}
-	if err := ss.checkRate(r.RateBps); err != nil {
+	rate := r.RateBps
+	if r.Video != nil {
+		if err := r.Video.Validate(); err != nil {
+			return nil, err
+		}
+		rate = r.Video.BitrateBps
+	}
+	if err := ss.checkRate(rate); err != nil {
 		return nil, err
 	}
 	if err := ss.checkDuration(time.Duration(r.DurationMs) * time.Millisecond); err != nil {
@@ -180,6 +219,9 @@ func (ss *session) udpSend(r UDPSendReq) (any, error) {
 	e := &sendEntry{done: make(chan struct{}), cancel: cancel}
 	ss.mu.Lock()
 	ss.sends[r.Stream] = e
+	if p := ss.peers[r.Stream]; p != nil {
+		e.peer.Store(p)
+	}
 	ss.mu.Unlock()
 	signer := proto.NewSigner(ss.key)
 	v4 := netx.IsV4(peer)
@@ -187,11 +229,15 @@ func (ss *session) udpSend(r UDPSendReq) (any, error) {
 	run := func() {
 		defer close(e.done)
 		defer cancel()
-		e.result = flow.SendUDP(ctx, signer, flow.UDPSendParams{
+		params := flow.UDPSendParams{
 			Session: ss.id.Short(), Stream: r.Stream, Type: r.Type, RateBps: r.RateBps, Size: r.Size,
 			Duration: time.Duration(r.DurationMs) * time.Millisecond, TOS: r.TOS, Count: r.Count,
-		}, func(b []byte, tos int) error {
-			p := ss.udpPeer.Load()
+		}
+		send := func(b []byte, tos int) error {
+			p := e.peer.Load()
+			if p == nil {
+				p = ss.udpPeer.Load()
+			}
 			if p == nil {
 				p = peer
 			}
@@ -202,13 +248,23 @@ func (ss *session) udpSend(r UDPSendReq) (any, error) {
 				_, err = udp.WriteToUDP(b, p)
 			}
 			return err
-		})
+		}
+		if r.Video != nil {
+			e.result = flow.SendVideo(ctx, signer, params, *r.Video, send)
+		} else {
+			e.result = flow.SendUDP(ctx, signer, params, send)
+		}
 	}
 	if r.Wait {
 		run()
 		return e.result, nil
 	}
 	go run()
+	// "pattern" tells clients this endpoint understood the video model
+	// (older endpoints ignore it and send a constant-rate stream).
+	if r.Video != nil {
+		return map[string]any{"started": true, "pattern": "video"}, nil
+	}
 	return map[string]any{"started": true}, nil
 }
 
@@ -232,6 +288,7 @@ func (ss *session) udpSendResult(r UDPSendResultReq) (flow.UDPSendResult, error)
 	}
 	ss.mu.Lock()
 	delete(ss.sends, r.Stream)
+	delete(ss.peers, r.Stream)
 	ss.mu.Unlock()
 	return e.result, nil
 }

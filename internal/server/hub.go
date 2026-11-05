@@ -244,6 +244,11 @@ func (h *Hub) StartRun(ctx context.Context, agentID string, req agentproto.RunRe
 	if _, err := (engine.Options{Profile: req.Profile, Tests: req.Tests}).TestList(); err != nil {
 		return "", err
 	}
+	if req.Mix != "" {
+		if _, _, err := engine.ParseMix(req.Mix); err != nil {
+			return "", err
+		}
+	}
 	a, err := h.s.store.Agent(ctx, agentID)
 	if err != nil {
 		return "", err

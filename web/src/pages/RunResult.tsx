@@ -32,6 +32,8 @@ export function RunResult({ run }: { run: Run }) {
     const q = new URLSearchParams({ agent: run.agent_id });
     if (o.tests?.length) q.set('tests', o.tests.join(','));
     else if (o.profile) q.set('profile', o.profile);
+    if (o.mix) q.set('mix', o.mix);
+    if (o.no_dscp) q.set('dscp', '0');
     navigate(`/runs/new?${q.toString()}`);
   };
 

@@ -47,6 +47,7 @@ type Client struct {
 	pmtuRecv  chan int
 	replyTTL  map[int]uint64
 	nextLocal atomic.Uint32
+	extra     map[*net.UDPConn]struct{} // per-session sockets (traffic mix)
 
 	closed chan struct{}
 	once   sync.Once
@@ -68,6 +69,7 @@ func Dial(ctx context.Context, addr, keyID string, key []byte) (*Client, error) 
 		pending: map[uint64]chan *proto.Msg{}, events: map[string]func(json.RawMessage){},
 		replyFn: map[uint32]func(proto.UDPHeader, time.Time, netx.RecvInfo){}, sinks: map[uint32]*flow.UDPSink{},
 		pmtuRecv: make(chan int, 64), replyTTL: map[int]uint64{}, closed: make(chan struct{}),
+		extra: map[*net.UDPConn]struct{}{},
 	}
 	c.nextLocal.Store(0x40000000)
 	ra := conn.RemoteAddr().(*net.TCPAddr)
@@ -87,7 +89,7 @@ func Dial(ctx context.Context, addr, keyID string, key []byte) (*Client, error) 
 	netx.SetBuffers(u, 8<<20)
 	c.udp = u
 	go c.readCtrl()
-	go c.readUDP()
+	go c.readUDP(u)
 	go c.keepalive()
 	c.punch()
 	return c, nil
@@ -147,6 +149,11 @@ func (c *Client) Close() error {
 		close(c.closed)
 		c.ctrl.Close()
 		c.udp.Close()
+		c.udpMu.Lock()
+		for u := range c.extra {
+			u.Close()
+		}
+		c.udpMu.Unlock()
 	})
 	return nil
 }
@@ -343,17 +350,20 @@ func (c *Client) ReplyTTLs() map[int]uint64 {
 	return out
 }
 
-func (c *Client) readUDP() {
+func (c *Client) readUDP(conn *net.UDPConn) {
 	buf := make([]byte, 65536)
 	oob := make([]byte, netx.OOBSize)
 	sg := c.Signer()
 	for {
-		n, oobn, _, _, err := c.udp.ReadMsgUDP(buf, oob)
+		n, oobn, _, _, err := conn.ReadMsgUDP(buf, oob)
 		if err != nil {
 			select {
 			case <-c.closed:
 				return
 			default:
+			}
+			if errors.Is(err, net.ErrClosed) {
+				return
 			}
 			var ne net.Error
 			if errors.As(err, &ne) && ne.Timeout() {
@@ -401,6 +411,60 @@ func (c *Client) readUDP() {
 			}
 		}
 	}
+}
+
+// UDPSock is an extra UDP socket with its own source port. A simulated
+// application session (one call) uses one, so queues on the path that
+// separate flows (fq_codel, CAKE, per-flow policers) see it as its own
+// flow, as they would the real application. Replies and reverse streams
+// arrive through the client's normal handlers.
+type UDPSock struct {
+	c    *Client
+	conn *net.UDPConn
+}
+
+// OpenUDP opens a per-session UDP socket to the endpoint.
+func (c *Client) OpenUDP() (*UDPSock, error) {
+	u, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: c.EndpointIP.AsSlice(), Port: c.Port})
+	if err != nil {
+		return nil, err
+	}
+	_ = netx.EnableRecvInfo(u)
+	netx.SetBuffers(u, 1<<20)
+	c.udpMu.Lock()
+	c.extra[u] = struct{}{}
+	c.udpMu.Unlock()
+	go c.readUDP(u)
+	return &UDPSock{c: c, conn: u}, nil
+}
+
+// Send sends one signed packet with an optional TOS.
+func (s *UDPSock) Send(b []byte, tos int) error {
+	if tos >= 0 {
+		_, _, err := s.conn.WriteMsgUDP(b, netx.TOSControl(tos, s.c.EndpointIP.Is4()), nil)
+		return err
+	}
+	_, err := s.conn.Write(b)
+	return err
+}
+
+// Punch tells the endpoint to send stream back to this socket (and opens
+// the NAT binding for it). Sent a few times: UDP may be lost.
+func (s *UDPSock) Punch(stream uint32) {
+	b := make([]byte, proto.UDPHeaderLen)
+	sg := s.c.Signer()
+	for i := 0; i < 3; i++ {
+		sg.Encode(b, &proto.UDPHeader{Type: proto.UDPPunch, Session: s.c.sid.Short(), Stream: stream, T1: time.Now().UnixNano()})
+		_, _ = s.conn.Write(b)
+	}
+}
+
+// Close closes the socket.
+func (s *UDPSock) Close() {
+	s.c.udpMu.Lock()
+	delete(s.c.extra, s.conn)
+	s.c.udpMu.Unlock()
+	s.conn.Close()
 }
 
 // punch opens or refreshes the NAT binding the endpoint sends to.

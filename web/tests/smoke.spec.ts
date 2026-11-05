@@ -107,6 +107,40 @@ test('dashboard smoke test', async ({ page }) => {
     await shot(page, '15-compare');
   });
 
+  await test.step('traffic mix options and results', async () => {
+    // The mix chooser appears with the mix test; custom counts are validated.
+    await page.goto(`/runs/new?agent=${agent!.id}&tests=info,mix,capacity-voice`);
+    await settled(page);
+    await expect(page.getByRole('heading', { name: '3. Traffic mix and calls' })).toBeVisible();
+    await expect(page.getByRole('radio', { name: /^Office/ })).toBeChecked();
+    await expect(page.getByLabel('Mark calls with DSCP (EF voice, AF41 video)')).toBeChecked();
+    await page.getByRole('radio', { name: /^Custom Choose how many/ }).check();
+    // Custom starts from the selected scenario (office: 10 voice calls).
+    const voice = page.getByRole('spinbutton', { name: 'Voice call (G.711)', exact: true });
+    await expect(voice).toHaveValue('10');
+    await voice.fill('300');
+    await expect(page.getByText('Voice call (G.711): at most 256 sessions.')).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Start run' })).toBeDisabled();
+    await voice.fill('4');
+    await expect(page.locator('p.mix-summary')).toContainText('4 G.711 voice calls');
+    await shot(page, '24-new-run-mix');
+
+    // Render a finished mix or capacity run if the server has one.
+    const recent = (await (await page.request.get('/api/runs?status=done&limit=50')).json()) as (RunJSON & { options?: { tests?: string[] } })[];
+    const mixRun = recent.find((r) => (r.options?.tests ?? []).some((t) => t === 'mix' || t.startsWith('capacity-')));
+    if (!mixRun) return test.info().annotations.push({ type: 'skipped', description: 'no completed mix or capacity run' });
+    await page.goto(`/runs/${mixRun.id}`);
+    await settled(page);
+    if ((mixRun.options?.tests ?? []).includes('mix')) {
+      await expect(page.getByText('Sessions with good quality, by kind')).toBeVisible();
+      await expect(page.getByText(/^Every session/).first()).toBeVisible();
+    }
+    if ((mixRun.options?.tests ?? []).some((t) => t.startsWith('capacity-'))) {
+      await expect(page.getByRole('heading', { name: 'On their own' }).first()).toBeVisible();
+    }
+    await shot(page, '25-mix-result');
+  });
+
   await test.step('create, use and delete things', async () => {
     const tag = `smoke-${Date.now()}`;
     const row = (text: string) => page.locator('tr', { hasText: text });

@@ -27,8 +27,8 @@ Errors look like `{"error": "message"}`, with a 4xx/5xx status.
 | `PUT /api/agents/{id}` | operator | `name, site, expected_down, expected_up, monitor_enabled, monitor_interval, notes` |
 | `POST /api/agents/{id}/revoke`, `DELETE /api/agents/{id}` | admin | Revoke (disconnects; data-plane key disabled) / delete |
 | `GET/POST /api/enroll-tokens`, `DELETE /api/enroll-tokens/{id}` | admin | Join tokens: `POST {hours, note}` → `{token, join_command}` |
-| `GET /api/profiles` | viewer | Profiles, test IDs and their titles |
-| `POST /api/runs` | operator | Start a run: `{agent_id, profile, tests?, skip?, scale?, max_rate_mbps?, streams?, trace_cycles?}` → `{run_id}`. Returns 409 if the agent is busy. |
+| `GET /api/profiles` | viewer | Profiles, test IDs and their titles; traffic-mix session kinds (`mix_kinds`: name, label, class, max), scenarios (`mix_scenarios`) and the default scenario (`mix_default`) |
+| `POST /api/runs` | operator | Start a run: `{agent_id, profile, tests?, skip?, scale?, max_rate_mbps?, streams?, trace_cycles?, mix?, no_dscp?}` → `{run_id}`. `mix` is a scenario name or `kind:count,...` for the `mix` test; `no_dscp` sends simulated calls unmarked. Returns 400 for an invalid mix and 409 if the agent is busy. |
 | `GET /api/runs?agent=&status=&limit=` | viewer | Run list (newest first) |
 | `GET /api/runs/{id}` | viewer | Run with the full `report` ([results schema](../internal/results/results.go)) |
 | `POST /api/runs/{id}/cancel`, `DELETE /api/runs/{id}` | operator | Cancel / delete |

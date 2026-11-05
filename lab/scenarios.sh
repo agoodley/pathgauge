@@ -163,6 +163,64 @@ scenario_qos_prio() {
         'finding("qos.priority")'
 }
 
+scenario_mix_fifo() {
+    # A bloated FIFO, as on many cable and DSL links (a 600 ms upload
+    # buffer): calls are fine on their own and fall apart once file
+    # transfers fill the queue.
+    lab impair a2b --delay 10ms --rate 20mbit --buffer 200ms
+    lab impair b2a --delay 10ms --rate 5mbit --buffer 600ms
+    client mixfifo --tests mix --mix "voice:4,video:1,web:1,download:1,upload:1" --scale 0.5 || return 1
+    check mixfifo 'steps_ok()' \
+        'mixkind("interactive", "voice")["verdict"] == "good"' \
+        'mixkind("interactive", "video")["verdict"] in ("good", "acceptable")' \
+        'mixkind("with-transfers", "voice")["verdict"] == "poor"' \
+        'mixkind("with-transfers", "voice")["value"] < mixkind("interactive", "voice")["value"] - 1' \
+        'mixkind("with-transfers", "video")["verdict"] == "poor"' \
+        'res("mix")["phases"][1]["probe_rtt_ms"]["p95"] > 300' \
+        'sev("mix.voice.degraded") == "warning" and finding("mix.video.degraded")'
+}
+
+scenario_mix_cake() {
+    # The same link with CAKE: flow isolation keeps calls good while the
+    # transfers run.
+    lab impair a2b --delay 10ms --rate 20mbit --qdisc cake
+    lab impair b2a --delay 10ms --rate 10mbit --qdisc cake
+    client mixcake --tests mix --mix "voice:4,video:1,web:1,download:1,upload:1" --scale 0.5 || return 1
+    check mixcake 'steps_ok()' \
+        'mixkind("with-transfers", "voice")["verdict"] == "good"' \
+        'mixkind("with-transfers", "video")["verdict"] in ("good", "acceptable")' \
+        'mixkind("with-transfers", "web")["verdict"] in ("good", "acceptable")' \
+        'not finding("mix.voice.degraded")' \
+        'res("mix")["phases"][1]["probe_rtt_ms"]["p95"] < 60'
+}
+
+scenario_mix_prio() {
+    # Strict priority for EF on a FIFO: marked voice is protected from the
+    # transfers, video (AF41, not prioritised here) is not.
+    lab impair a2b --delay 5ms --rate 20mbit --buffer 200ms --qdisc prio
+    lab impair b2a --delay 5ms --rate 10mbit --buffer 200ms --qdisc prio
+    client mixprio --tests mix --mix "voice:4,video:1,download:1,upload:1" --scale 0.5 || return 1
+    check mixprio 'steps_ok()' \
+        'res("mix")["dscp"]' \
+        'mixkind("with-transfers", "voice")["verdict"] == "good"' \
+        'mixkind("with-transfers", "video")["verdict"] == "poor"' \
+        'not finding("mix.voice.degraded") and finding("mix.video.degraded")'
+}
+
+scenario_capacity() {
+    # 4 Mbit/s each way with fq_codel: about 50 G.711 calls fit (80 kbit/s
+    # each way with headers).
+    lab impair a2b --delay 5ms --rate 4mbit --qdisc fq_codel
+    lab impair b2a --delay 5ms --rate 4mbit --qdisc fq_codel
+    client capacity --tests capacity-voice --scale 0.5 || return 1
+    check capacity 'steps_ok()' \
+        '30 <= res("capacity")["alone"]["acceptable"] <= 56' \
+        'res("capacity")["alone"]["good"] <= res("capacity")["alone"]["acceptable"]' \
+        'not res("capacity")["alone"].get("limit")' \
+        '20 <= res("capacity")["with_transfers"]["acceptable"] <= 56' \
+        'finding("capacity.voice")'
+}
+
 scenario_ipv6() {
     # The same checks over IPv6, through two routers, with a 1400-byte
     # link so Packet Too Big handling is exercised.
@@ -282,7 +340,7 @@ trap './netns.sh down >/dev/null 2>&1' EXIT
 ./netns.sh exec a "$PG" endpoint --listen "[$A6]:7401" --key "$KEY" --log-level warn > "$OUT/endpoint6.log" 2>&1 &
 sleep 1
 
-ALL=(clean bufferbloat cake policer shaper loss reorder middlebox pmtu_blackhole pmtu_ok nat owd sqm unprivileged ipv6 qos_fifo qos_prio)
+ALL=(clean bufferbloat cake policer shaper loss reorder middlebox pmtu_blackhole pmtu_ok nat owd sqm unprivileged ipv6 qos_fifo qos_prio mix_fifo mix_cake mix_prio capacity)
 SEL=("$@")
 [ ${#SEL[@]} -eq 0 ] && SEL=("${ALL[@]}")
 for s in "${SEL[@]}"; do run "$s"; done

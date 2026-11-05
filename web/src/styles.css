@@ -1193,6 +1193,99 @@ input[type='file'] {
   color: var(--muted);
 }
 
+/* ---- traffic mix and call capacity ---- */
+
+.mix-chooser {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.mix-builder {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 12px;
+}
+.mix-builder .row-actions {
+  grid-column: 1 / -1;
+}
+.mix-count {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 76px;
+  grid-template-areas: 'label input' 'hint input';
+  column-gap: 10px;
+  align-items: center;
+}
+.mix-count-label {
+  grid-area: label;
+  font-size: 13px;
+}
+.mix-count input {
+  grid-area: input;
+  width: 76px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.mix-count input[aria-invalid='true'] {
+  border-color: var(--critical);
+  box-shadow: 0 0 0 1px var(--critical);
+}
+.mix-count .field-hint {
+  grid-area: hint;
+}
+.mix-summary {
+  margin: 0;
+}
+.mix-dscp {
+  margin-top: 14px;
+}
+.mix-dscp .field-hint {
+  margin: 2px 0 0 24px;
+}
+.mix-overview {
+  line-height: 1.8;
+}
+.mix-overall {
+  font-weight: 600;
+  margin-right: 4px;
+  white-space: nowrap;
+}
+.mix-phase {
+  margin-top: 14px;
+}
+.mix-phase-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 2px;
+}
+.mix-phase-head + p {
+  margin-top: 0;
+}
+.capacity-tiles {
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  margin-bottom: 4px;
+}
+.nowrap {
+  white-space: nowrap;
+}
+/* Keep text columns wide enough that narrow screens scroll the table
+   instead of stacking every word. */
+.mix-kinds td:first-child {
+  min-width: 9em;
+}
+.mix-kinds td:nth-child(5) {
+  min-width: 22em;
+}
+td.mix-flow {
+  min-width: 13em;
+}
+.tile-prefix {
+  font-size: 14px;
+  font-weight: 550;
+  color: var(--text-2);
+}
+
 /* ---- tiles ---- */
 
 .tiles {
