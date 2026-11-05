@@ -105,7 +105,7 @@ jobs:
           - { image: "rockylinux/rockylinux:10", pattern: "*.x86_64.rpm" }
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: packages
           path: dist
@@ -140,7 +140,7 @@ jobs:
               CMD ["/sbin/init"]
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: packages
           path: dist
@@ -161,7 +161,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: packages
           path: dist
