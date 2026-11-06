@@ -27,7 +27,7 @@ jobs:
       # Publishes a draft GitHub Release with .deb/.rpm/.tar.gz for amd64 and
       # arm64. Package signing, SBOMs and provenance are added before the
       # first public release (docs/PLAN.md §24).
-      - uses: goreleaser/goreleaser-action@v6
+      - uses: goreleaser/goreleaser-action@v7
         with:
           version: "~> v2"
           args: release --clean
