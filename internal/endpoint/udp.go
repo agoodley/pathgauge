@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/agoodley/pathgauge/internal/flow"
+	"github.com/agoodley/pathgauge/internal/guard"
 	"github.com/agoodley/pathgauge/internal/netx"
 	"github.com/agoodley/pathgauge/internal/proto"
 )
@@ -259,7 +260,7 @@ func (ss *session) udpSend(r UDPSendReq) (any, error) {
 		run()
 		return e.result, nil
 	}
-	go run()
+	guard.Go(ss.srv.log, "UDP send", run)
 	// "pattern" tells clients this endpoint understood the video model
 	// (older endpoints ignore it and send a constant-rate stream).
 	if r.Video != nil {

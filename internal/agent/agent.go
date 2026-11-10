@@ -34,6 +34,7 @@ import (
 	"github.com/agoodley/pathgauge/internal/config"
 	"github.com/agoodley/pathgauge/internal/engine"
 	"github.com/agoodley/pathgauge/internal/enrich"
+	"github.com/agoodley/pathgauge/internal/guard"
 	"github.com/agoodley/pathgauge/internal/hostinfo"
 	"github.com/agoodley/pathgauge/internal/pki"
 	"github.com/agoodley/pathgauge/internal/results"
@@ -319,7 +320,7 @@ func New(cfg config.Agent, policy config.Policy, log *slog.Logger) (*Agent, erro
 // Run connects to the server and serves until ctx ends.
 func (a *Agent) Run(ctx context.Context) error {
 	a.log.Info("agent starting", "name", a.id.Name, "id", a.id.AgentID, "server", a.id.ServerURL, "version", version.Get().Version)
-	go a.monitorLoop(ctx)
+	go guard.Loop(ctx, a.log, "monitoring", a.monitorLoop)
 	backoff := time.Second
 	for ctx.Err() == nil {
 		start := time.Now()
@@ -580,6 +581,12 @@ func (a *Agent) startRun(ctx context.Context, runID string, req agentproto.RunRe
 			a.mu.Lock()
 			a.runCancel, a.runID = nil, ""
 			a.mu.Unlock()
+		}()
+		// A bug in one run fails that run; the agent stays up for the next.
+		defer func() {
+			if guard.Recovered(a.log, "run "+runID, recover()) {
+				a.send(agentproto.Msg{Type: agentproto.TypeFailed, RunID: runID, Error: "internal error in the agent (see its log)"})
+			}
 		}()
 		opts, notes, err := a.buildOptions(req)
 		if err != nil {

@@ -115,7 +115,7 @@ func mixSection(b *strings.Builder, v *results.Mix) {
 func capacitySection(b *strings.Builder, v *results.Capacity) {
 	count := func(s results.CapacitySearch) string {
 		if s.Limit > 0 {
-			return fmt.Sprintf("at least %d (stopped at the %s)", s.Acceptable, s.LimitReason)
+			return fmt.Sprintf("at least %d (stopped at the %s)", s.Acceptable, html.EscapeString(s.LimitReason))
 		}
 		return fmt.Sprint(s.Acceptable)
 	}

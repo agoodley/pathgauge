@@ -16,6 +16,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io/fs"
 	"math/big"
 	"net"
 	"os"
@@ -37,15 +38,27 @@ func serial() *big.Int {
 	return n
 }
 
-// LoadOrCreateCA loads ca.crt/ca.key from dir, creating them if missing.
+// LoadOrCreateCA loads ca.crt/ca.key from dir. It creates them only when
+// neither exists: a new CA orphans every enrolled agent, so a certificate
+// that can't be read, or a key left without its certificate, is an error to
+// fix by hand and never a reason to start over.
 func LoadOrCreateCA(dir string) (*CA, error) {
 	certPath, keyPath := filepath.Join(dir, "ca.crt"), filepath.Join(dir, "ca.key")
-	if cb, err := os.ReadFile(certPath); err == nil {
+	cb, err := os.ReadFile(certPath)
+	switch {
+	case err == nil:
 		kb, err := os.ReadFile(keyPath)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("the CA certificate %s exists but its key can't be read: %w", certPath, err)
 		}
 		return parseCA(cb, kb)
+	case !errors.Is(err, fs.ErrNotExist):
+		return nil, fmt.Errorf("read the CA certificate: %w", err)
+	}
+	if _, err := os.Lstat(keyPath); err == nil {
+		return nil, fmt.Errorf("the CA key %s exists but the certificate %s is missing: restore the certificate from a backup, or remove the key to create a new CA (every agent must then be enrolled again)", keyPath, certPath)
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return nil, fmt.Errorf("check for an existing CA key: %w", err)
 	}
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -72,7 +85,16 @@ func LoadOrCreateCA(dir string) (*CA, error) {
 		return nil, err
 	}
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: kder})
-	if err := os.WriteFile(keyPath, keyPEM, 0o600); err != nil {
+	// O_EXCL: never write over a key that appeared in the meantime.
+	kf, err := os.OpenFile(keyPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := kf.Write(keyPEM); err != nil {
+		_ = kf.Close()
+		return nil, err
+	}
+	if err := kf.Close(); err != nil {
 		return nil, err
 	}
 	if err := os.WriteFile(certPath, certPEM, 0o644); err != nil {

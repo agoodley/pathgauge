@@ -81,7 +81,14 @@ func (t *Tuner) Run(ctx context.Context, c *engine.Client, down, up float64, pro
 		}
 		st.Qdisc = ap.Qdisc
 		b, err := engine.RunBufferbloat(ctx, c, lite)
-		_ = t.m.Clear(ctx)
+		if cerr := t.m.Clear(ctx); cerr != nil {
+			// Nothing measured from here on would mean anything, and the
+			// manager keeps retrying the removal by itself.
+			st.Error = cerr.Error()
+			res.Steps = append(res.Steps, st)
+			res.Note = "stopped: " + cerr.Error()
+			break
+		}
 		if err != nil {
 			st.Error = err.Error()
 		} else {

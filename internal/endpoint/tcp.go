@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/agoodley/pathgauge/internal/flow"
+	"github.com/agoodley/pathgauge/internal/guard"
 	"github.com/agoodley/pathgauge/internal/netx"
 	"github.com/agoodley/pathgauge/internal/proto"
 )
@@ -115,16 +116,27 @@ func (ss *session) tcpPrepare(p TCPPrepare) (TCPPrepared, error) {
 		allIn: make(chan struct{}), done: make(chan struct{}),
 	}
 	t.sampler.Interval = time.Duration(max(p.IntervalMs, 20)) * time.Millisecond
+	// Start with whatever connected if some streams never arrive. The timer
+	// exists before the test is published, because start() stops it; it is
+	// set under the lock start() reads it under.
+	t.mu.Lock()
+	t.timer = time.AfterFunc(attachTimeout, func() {
+		defer func() { guard.Recovered(ss.srv.log, "TCP test start", recover()) }()
+		t.start()
+	})
+	t.mu.Unlock()
 	ss.mu.Lock()
 	ss.tests[t.id] = t
 	for _, id := range t.ids {
 		ss.slots[id] = t
 	}
 	ss.mu.Unlock()
-	// Start with whatever connected if some streams never arrive.
-	t.timer = time.AfterFunc(10*time.Second, func() { t.start() })
 	return TCPPrepared{TestID: t.id, Streams: t.ids}, nil
 }
+
+// attachTimeout is how long a test waits for its data connections before
+// starting with the ones that arrived.
+var attachTimeout = 10 * time.Second
 
 func (ss *session) attachStream(id uint32, c *net.TCPConn) {
 	ss.mu.Lock()
@@ -145,6 +157,14 @@ func (ss *session) attachStream(id uint32, c *net.TCPConn) {
 	_ = netx.SetPacingRate(c, t.p.PacingBps)
 	netx.SetBuffers(c, t.p.BufferBytes)
 	t.mu.Lock()
+	// A test that has started (all streams in, or the wait for them ran
+	// out) has a fixed set of streams: start() rebuilt t.streams without
+	// the missing ones, so a late connection has no place in it.
+	if t.started || idx < 0 || idx >= len(t.streams) || t.streams[idx] != nil {
+		t.mu.Unlock()
+		c.Close()
+		return
+	}
 	t.streams[idx] = &flow.Stream{ID: id, Conn: c}
 	t.attached++
 	all := t.attached == len(t.ids)
@@ -170,6 +190,14 @@ func (t *tcpTest) start() {
 	}
 	t.streams = streams
 	t.mu.Unlock()
+	// Streams that never arrived can no longer join.
+	t.ss.mu.Lock()
+	for _, id := range t.ids {
+		if t.ss.slots[id] == t {
+			delete(t.ss.slots, id)
+		}
+	}
+	t.ss.mu.Unlock()
 	close(t.allIn)
 	if len(streams) == 0 {
 		t.err = errors.New("no data connections arrived")
@@ -181,6 +209,12 @@ func (t *tcpTest) start() {
 
 func (t *tcpTest) run(streams []*flow.Stream) {
 	defer close(t.done)
+	log := t.ss.srv.log
+	defer func() {
+		if guard.Recovered(log, "TCP test", recover()) {
+			t.err = errors.New("internal error in the endpoint (see its log)")
+		}
+	}()
 	if t.p.Role == "hold" {
 		<-t.ss.ctx.Done()
 		return
@@ -202,8 +236,9 @@ func (t *tcpTest) run(streams []*flow.Stream) {
 	sctx, scancel := context.WithCancel(ctx)
 	sampDone := make(chan struct{})
 	go func() {
+		defer close(sampDone)
+		defer func() { guard.Recovered(log, "TCP test sampler", recover()) }()
 		t.sampler.Run(sctx, streams, onSample)
-		close(sampDone)
 	}()
 	if t.p.Role == "send" && t.p.CDP != nil {
 		res := flow.SendCDP(ctx, streams, *t.p.CDP, t.p.CDPLimitBps, d)
@@ -220,6 +255,7 @@ func (t *tcpTest) run(streams []*flow.Stream) {
 		wg.Add(1)
 		go func(s *flow.Stream) {
 			defer wg.Done()
+			defer func() { guard.Recovered(log, "TCP test stream", recover()) }()
 			if t.p.Role == "send" {
 				_ = s.Send(ctx, 128<<10, t.p.Compressible, t.p.Bytes)
 				_ = s.Conn.CloseWrite()

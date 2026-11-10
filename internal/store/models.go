@@ -437,11 +437,22 @@ type RunSummary struct {
 	Findings    json.RawMessage
 }
 
-// FinishRun stores the report.
-func (s *Store) FinishRun(ctx context.Context, id string, report json.RawMessage, sum RunSummary) error {
-	_, err := s.DB.ExecContext(ctx, `UPDATE runs SET status='done', ended_at=?, report_json=?, health_score=?, down_mbps=?, up_mbps=?, rtt_ms=?, bloat_grade=?, findings_json=? WHERE id=?`,
-		Now(), string(report), sum.HealthScore, sum.DownMbps, sum.UpMbps, sum.RTTms, sum.BloatGrade, string(sum.Findings), id)
-	return err
+// FinishRun stores the report of a run and marks it done. It reports
+// whether a run was updated.
+//
+// Only the agent the run was given to can finish it, and only while the
+// run is running or failed: a result that arrives late (after a
+// disconnect or a timeout) completes a failed run, but nothing replaces a
+// stored report or reverses a cancellation.
+func (s *Store) FinishRun(ctx context.Context, id, agentID string, report json.RawMessage, sum RunSummary) (bool, error) {
+	res, err := s.DB.ExecContext(ctx, `UPDATE runs SET status='done', ended_at=?, error=NULL, report_json=?, health_score=?, down_mbps=?, up_mbps=?, rtt_ms=?, bloat_grade=?, findings_json=?
+		WHERE id=? AND agent_id=? AND status IN ('running','failed')`,
+		Now(), string(report), sum.HealthScore, sum.DownMbps, sum.UpMbps, sum.RTTms, sum.BloatGrade, string(sum.Findings), id, agentID)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
 }
 
 // GetRun loads a run, optionally with its report.

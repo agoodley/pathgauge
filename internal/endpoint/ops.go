@@ -158,8 +158,8 @@ func (ss *session) handle(op string, data json.RawMessage) (any, error) {
 		if ss.srv.opts.Shaper == nil || ss.srv.opts.Policy.Shaping == "none" {
 			return nil, errors.New("shaping is not permitted on this endpoint")
 		}
-		ss.usedShaping = true
-		return ss.srv.opts.Shaper.Apply(ss.ctx, data)
+		ss.usedShaping.Store(true)
+		return ss.srv.opts.Shaper.Apply(ss.ctx, data, ss.observed.Addr())
 	case "shape_clear":
 		if ss.srv.opts.Shaper == nil {
 			return nil, errors.New("shaping is not available on this endpoint")

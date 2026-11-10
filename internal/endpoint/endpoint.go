@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/agoodley/pathgauge/internal/config"
+	"github.com/agoodley/pathgauge/internal/guard"
 	"github.com/agoodley/pathgauge/internal/netx"
 	"github.com/agoodley/pathgauge/internal/proto"
 	"github.com/agoodley/pathgauge/internal/version"
@@ -39,8 +40,13 @@ func (s StaticKeys) Lookup(id string) ([]byte, bool) {
 }
 
 // Shaper applies time-limited traffic shaping on request (optional).
+//
+// Apply is given the address of the client that asked. A remote client
+// chooses rates and impairments; it never chooses the interface (that is
+// always the one that routes to the client) and can't force the replacement
+// of a qdisc the host's owner configured.
 type Shaper interface {
-	Apply(ctx context.Context, req json.RawMessage) (any, error)
+	Apply(ctx context.Context, req json.RawMessage, client netip.Addr) (any, error)
 	Clear(ctx context.Context) error
 }
 
@@ -75,6 +81,10 @@ func New(opts Options) *Server {
 	}
 	if opts.Policy.MaxRateMbps == 0 {
 		opts.Policy = config.DefaultPolicy()
+	}
+	if opts.Shaper == nil {
+		// Tell clients what this endpoint accepts, not what its host could do.
+		opts.Policy.Shaping = config.ShapingNone
 	}
 	return &Server{opts: opts, log: opts.Logger, sessions: map[uint64]*session{}}
 }
@@ -117,7 +127,7 @@ func (s *Server) Serve(ctx context.Context) error {
 		_ = s.tcp.Close()
 		_ = s.udp.Close()
 	}()
-	go s.udpLoop(ctx)
+	go guard.Loop(ctx, s.log, "endpoint UDP loop", s.udpLoop)
 	for {
 		c, err := s.tcp.Accept()
 		if err != nil {
@@ -135,6 +145,12 @@ func (s *Server) Serve(ctx context.Context) error {
 }
 
 func (s *Server) handleConn(ctx context.Context, c *net.TCPConn) {
+	// A bug while serving one connection must cost that connection only.
+	defer func() {
+		if guard.Recovered(s.log, "endpoint connection", recover()) {
+			c.Close()
+		}
+	}()
 	_ = c.SetReadDeadline(time.Now().Add(10 * time.Second))
 	pre := make([]byte, 5)
 	if _, err := io.ReadFull(c, pre); err != nil || string(pre[:4]) != proto.Magic {
@@ -202,7 +218,7 @@ type session struct {
 	probeTOS map[int]uint64
 	pmtuSeen int
 
-	usedShaping bool
+	usedShaping atomic.Bool
 }
 
 func (s *Server) handleControl(ctx context.Context, c *net.TCPConn) {
@@ -229,7 +245,7 @@ func (s *Server) handleControl(ctx context.Context, c *net.TCPConn) {
 		delete(s.sessions, sess.id.Short())
 		s.mu.Unlock()
 		s.active.Add(-1)
-		if sess.usedShaping && s.opts.Shaper != nil {
+		if sess.usedShaping.Load() && s.opts.Shaper != nil {
 			_ = s.opts.Shaper.Clear(context.Background())
 		}
 		s.log.Info("session ended", "client", sess.keyID)
@@ -312,8 +328,19 @@ func (ss *session) event(op string, data any) {
 	_ = ss.send(&proto.Msg{Type: "event", Op: op, Data: proto.Encode(data)})
 }
 
+// safeHandle runs one operation; a panic in it becomes an error response,
+// so the client is told at once and the endpoint keeps running.
+func (ss *session) safeHandle(op string, data json.RawMessage) (res any, err error) {
+	defer func() {
+		if guard.Recovered(ss.srv.log, "endpoint operation "+strconv.Quote(op), recover()) {
+			res, err = nil, errors.New("internal error in the endpoint (see its log)")
+		}
+	}()
+	return ss.handle(op, data)
+}
+
 func (ss *session) dispatch(m *proto.Msg) {
-	res, err := ss.handle(m.Op, m.Data)
+	res, err := ss.safeHandle(m.Op, m.Data)
 	resp := &proto.Msg{Type: "resp", ID: m.ID, Op: m.Op, OK: err == nil}
 	if err != nil {
 		resp.Error = err.Error()

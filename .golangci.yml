@@ -32,7 +32,7 @@ linters:
         linters: [errcheck, gosec, usestdlibvars]
       - path: internal/report/
         linters: [gosec]
-        text: G203 # report HTML is built from escaped strings (html.EscapeString) by design
+        text: G203 # report HTML is built from escaped strings; internal/report/escape_test.go checks every field
       - path: internal/pki/
         linters: [gosec]
         text: G306 # certificates are public; private keys are written 0600
