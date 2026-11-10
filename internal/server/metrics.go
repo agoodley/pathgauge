@@ -36,8 +36,11 @@ func (s *Server) apiMetrics(w http.ResponseWriter, r *http.Request) {
 			if !ok || time.Since(time.Unix(x.TS, 0)) > 15*time.Minute || a.Revoked {
 				continue
 			}
-			v := map[string]float64{"pathgauge_monitor_rtt_p50_ms": x.RTTP50, "pathgauge_monitor_rtt_p95_ms": x.RTTP95, "pathgauge_monitor_jitter_ms": x.Jitter, "pathgauge_monitor_loss_percent": x.LossPct}[g.name]
-			fmt.Fprintf(&b, "%s{agent=%q,id=%q} %g\n", g.name, esc(a.Name), a.ID, v)
+			v := map[string]*float64{"pathgauge_monitor_rtt_p50_ms": x.RTTP50, "pathgauge_monitor_rtt_p95_ms": x.RTTP95, "pathgauge_monitor_jitter_ms": x.Jitter, "pathgauge_monitor_loss_percent": &x.LossPct}[g.name]
+			if v == nil {
+				continue // no probe was answered: there is no latency to export
+			}
+			fmt.Fprintf(&b, "%s{agent=%q,id=%q} %g\n", g.name, esc(a.Name), a.ID, *v)
 		}
 	}
 	runGauges := []gauge{{"pathgauge_last_run_health_score", "Health score of the latest run"}, {"pathgauge_last_run_down_mbps", "Download of the latest run"},

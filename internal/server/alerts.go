@@ -127,17 +127,25 @@ func (a *Alerts) monitorValue(ctx context.Context, r store.AlertRule, ag store.A
 		return 0, false
 	}
 	// Every sample in the window must breach (a sustained condition): use
-	// the least-breaching value.
+	// the least-breaching value. A sample with no answered probe has no
+	// latency, so it says nothing about a latency rule either way: the
+	// rule keeps its state through an outage (the loss rule covers that).
 	best := math.NaN()
 	for _, x := range ss {
 		var v float64
 		switch r.Metric {
 		case "rtt_p95":
-			v = x.RTTP95
+			if x.RTTP95 == nil {
+				continue
+			}
+			v = *x.RTTP95
 		case "loss_pct":
 			v = x.LossPct
 		case "jitter":
-			v = x.Jitter
+			if x.Jitter == nil {
+				continue
+			}
+			v = *x.Jitter
 		}
 		if math.IsNaN(best) || (r.Op == ">" && v < best) || (r.Op == "<" && v > best) {
 			best = v

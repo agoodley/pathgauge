@@ -118,8 +118,10 @@ Add `--debug` to see each step (TCP, TLS, request, answer). If the join hangs, s
 The token is single-use and expires (default 24 hours). It also carries a fingerprint of the server's CA, so the agent refuses to enrol with anything else, even if someone intercepts the connection. After joining:
 
 - the agent connects to the server with mutual TLS
-- reconnects automatically if the connection drops
+- reconnects automatically if the connection drops. A test that is running carries on: the run shows as waiting for its agent, live progress resumes when the agent is back, and a result finished in the meantime is uploaded then
 - runs continuous latency monitoring (a 10-second probe burst every minute, by default)
+
+A run ends early only if you cancel it, the agent is stopped, or it exceeds its time limit (5, 15 or 45 minutes for the quick, standard and full profiles, times `scale`, plus the time asked for by groups and CDP tests). The server then also stops it on the agent. A run that was cut short is recorded as failed; its partial results are not kept.
 
 ### Agent policy
 
@@ -188,6 +190,8 @@ Each finding states what was seen, why it matters and what to do. Key ideas:
   - **burst allowance**: fast at first, then a lower sustained rate
   - **non-congestive loss**: loss at every rate, so suspect cabling, radio or interface errors
 - **Traceroute loss:** routers rate-limit their ICMP replies, so loss at one hop that doesn't continue downstream is harmless. PathGauge only reports real path loss when its own end-to-end measurement also shows loss.
+- **Traceroute that stops early:** if a device on the way refuses the probes (an ICMP "destination unreachable" other than "port unreachable", typically a firewall's "administratively prohibited"), the trace ends at that hop and says so. It is not counted as reaching the destination.
+- **Tests under load:** bufferbloat, `voip-loaded`, the traffic mix with transfers and call capacity with transfers need their background load. If the load can't start or carries no data, the test fails with the reason; it does not report the idle link's figures as if they were measured under load.
 - **QoS under load (`qos` test):** EF (voice), AF41 (video) and best-effort probes run while the link is saturated. If EF's latency rises much less than best effort's, priority queuing works on the path.
 - **Host limits:** UDP tests count packets the receiving host itself dropped (socket buffer full), and sweep steps the sending host couldn't generate. These are reported as *host-limited* rather than blamed on the network; this matters on small VMs and Raspberry Pis.
 - **Middlebox checks:**
@@ -315,8 +319,9 @@ On the dashboard, New run has a "Run together" section. In the API and the test 
 ## 10. Monitoring, alerts and schedules
 
 - **Monitoring:** each agent sends a latency, jitter and loss sample to the server every minute. You can change the interval per agent or turn it off. Monitoring pauses while a test runs. Samples are kept for 90 days (`retention_days` in `server.yaml`).
+- **Outages:** an interval in which no probe was answered is recorded as 100% loss with no latency or jitter. The charts show a break in the latency lines there, not a drop to zero.
 - **Alert metrics:**
-  - `rtt_p95`, `loss_pct` and `jitter`: must breach the threshold for every sample in the window (`for_minutes`)
+  - `rtt_p95`, `loss_pct` and `jitter`: must breach the threshold for every sample in the window (`for_minutes`). Intervals with no answered probe are left out of `rtt_p95` and `jitter` rules, so a latency alert neither fires nor resolves because the link went down. Use a `loss_pct` or `offline` rule to be told about an outage.
   - `offline`: minutes since the agent was last seen
   - `health_score`, `down_mbps` and `up_mbps`: evaluated when each run finishes
 

@@ -56,9 +56,15 @@ func (pp PlayoutParams) Playout(sendUs []int64, delay []float64) PlayoutResult {
 		for lo < k && sendUs[k]-sendUs[lo] > win {
 			lo++
 		}
-		// Re-plan every few samples, after a late sample, and on every
-		// sample while history is short.
-		if k > 0 && (k%4 == 0 || wasLate || k-lo < 8) {
+		if lo == k && k > 0 {
+			// Nothing was sent within the window before this sample (a
+			// gap or outage longer than the buffer's memory), so there is
+			// no history to plan from. Start again as at the beginning of
+			// the stream, as a real buffer does after it has run dry.
+			target = delay[k] + pp.MinMs
+		} else if k > 0 && (k%4 == 0 || wasLate || k-lo < 8) {
+			// Re-plan every few samples, after a late sample, and on every
+			// sample while history is short.
 			base := math.Inf(1)
 			for _, d := range delay[lo:k] {
 				base = math.Min(base, d)
@@ -90,7 +96,7 @@ func (pp PlayoutParams) Playout(sendUs []int64, delay []float64) PlayoutResult {
 
 // PlayoutLog replays a stream's packet log (any order) through the buffer.
 func (pp PlayoutParams) PlayoutLog(log *PacketLog) PlayoutResult {
-	if log == nil || len(log.Seq) == 0 {
+	if log == nil || len(log.Seq) == 0 || len(log.T1Us) != len(log.Seq) || len(log.RxUs) != len(log.Seq) {
 		return PlayoutResult{}
 	}
 	idx := make([]int, len(log.Seq))

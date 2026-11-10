@@ -244,6 +244,12 @@ func (e SockErr) IsUnreachable() bool {
 	return (e.Origin == unix.SO_EE_ORIGIN_ICMP && e.Type == 3) || (e.Origin == unix.SO_EE_ORIGIN_ICMP6 && e.Type == 1)
 }
 
+// IsPortUnreachable reports an ICMP(v6) port unreachable: the packet
+// reached a host with nothing listening on that port.
+func (e SockErr) IsPortUnreachable() bool {
+	return (e.Origin == unix.SO_EE_ORIGIN_ICMP && e.Type == 3 && e.Code == 3) || (e.Origin == unix.SO_EE_ORIGIN_ICMP6 && e.Type == 1 && e.Code == 4)
+}
+
 // ErrNoError means the error queue was empty.
 var ErrNoError = errors.New("error queue empty")
 

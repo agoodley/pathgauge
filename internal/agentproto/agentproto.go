@@ -39,6 +39,10 @@ type Hello struct {
 	Version string          `json:"version"`
 	Host    json.RawMessage `json:"host"`
 	Policy  json.RawMessage `json:"policy"`
+	// RunID is the run this agent is still working on: a test keeps going
+	// when the control connection drops. The server reattaches it, or
+	// answers with a cancel if it has given up on that run.
+	RunID string `json:"run_id,omitempty"`
 }
 
 // Welcome tells the agent how to reach the server's data plane.

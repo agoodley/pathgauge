@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"sync"
 	"time"
@@ -136,22 +137,30 @@ func RunBufferbloat(ctx context.Context, c *Client, bp BloatParams) (*results.Bu
 			}()
 		}
 		wg.Wait()
-		if errDown != nil {
-			runErr = errDown
+		setPhase("drain")
+		// A phase is latency under load only if the load ran. Without it
+		// the probes measured an idle link, which would grade as A+.
+		if ph == "down" || ph == "bidir" {
+			runErr = loadErr("the download load", l.down, errDown)
 		}
-		if errUp != nil {
-			runErr = errUp
+		if runErr == nil && (ph == "up" || ph == "bidir") {
+			runErr = loadErr("the upload load", l.up, errUp)
+		}
+		if runErr != nil {
+			break
 		}
 		loads[ph] = l
-		setPhase("drain")
 		sleepCtx(ctx, 2*time.Second) // let queues drain between phases
 	}
 	stopProbes()
 	pwg.Wait()
-	sleepCtx(ctx, 500*time.Millisecond)
-	if runErr != nil && len(loads) == 0 {
-		return nil, runErr
+	if runErr != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, fmt.Errorf("%w, so latency under load was not measured", runErr)
 	}
+	sleepCtx(ctx, 500*time.Millisecond)
 
 	byPhase := map[string][]float64{}
 	sent := map[string]int{}
@@ -171,7 +180,11 @@ func RunBufferbloat(ctx context.Context, c *Client, bp BloatParams) (*results.Bu
 
 	idle := stats.Summarize(byPhase["idle"])
 	phases := []string{"idle"}
-	phases = append(phases, bp.Phases...)
+	for _, ph := range bp.Phases {
+		if _, ran := loads[ph]; ran { // a cancelled run stops early
+			phases = append(phases, ph)
+		}
+	}
 	var working []float64
 	for _, ph := range phases {
 		bpr := results.BloatPhase{Name: ph, RTT: roundSum(stats.Summarize(byPhase[ph])), Connect: roundSum(stats.Summarize(connects[ph]))}
@@ -275,4 +288,16 @@ func classifyQueue(b *results.Bufferbloat, idleMedian float64) string {
 		return "fifo"
 	}
 	return "unclear"
+}
+
+// loadErr says why a background load makes the test that needed it
+// invalid, or returns nil if the load ran and carried data.
+func loadErr(what string, r *results.TCP, err error) error {
+	switch {
+	case err != nil:
+		return fmt.Errorf("%s did not run (%w)", what, err)
+	case r == nil || r.Mbps <= 0:
+		return fmt.Errorf("%s carried no data", what)
+	}
+	return nil
 }

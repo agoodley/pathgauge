@@ -206,7 +206,7 @@ func Run(ctx context.Context, c *Client, o Options) (*results.Report, error) {
 	}
 	rep.EndedAt = time.Now().UTC()
 	if ctx.Err() != nil {
-		rep.Notes = append(rep.Notes, "run cancelled before completion")
+		rep.Notes = append(rep.Notes, results.NoteCancelled)
 	}
 	return rep, nil
 }

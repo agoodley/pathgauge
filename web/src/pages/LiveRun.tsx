@@ -397,7 +397,13 @@ export function LiveRun({ run, onChange }: { run: Run; onChange: () => void }) {
           {running.length > 1 && ` · ${running.length} running together`}
         </div>
       </div>
-      {!st.sawStart && events.length === 0 && (
+      {run.agent_away && (
+        <Notice kind="warning">
+          The agent has lost its connection to the server. The test carries on running on the agent; live progress resumes when it
+          reconnects, and the result is uploaded when the run finishes.
+        </Notice>
+      )}
+      {!st.sawStart && events.length === 0 && !run.agent_away && (
         <Notice kind="info">Waiting for the agent… live progress appears as each step starts. (Steps that finished before this page opened are shown when the run completes.)</Notice>
       )}
       <div className="live-grid">

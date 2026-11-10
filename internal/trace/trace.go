@@ -73,13 +73,17 @@ func (o *Options) defaults() {
 
 // reply is one probe outcome.
 type reply struct {
-	ttl    int
-	from   netip.Addr
-	rtt    time.Duration
-	ok     bool
-	dest   bool
-	mpls   []string
-	errMsg string
+	ttl  int
+	from netip.Addr
+	rtt  time.Duration
+	ok   bool
+	dest bool
+	// blocked: a device answered "destination unreachable" for a reason
+	// other than a closed port (no route, administratively prohibited...).
+	// Probes go no further, but the destination was not reached.
+	blocked bool
+	mpls    []string
+	errMsg  string
 }
 
 // prober sends one cycle of probes and returns the replies.
@@ -99,7 +103,12 @@ func Run(ctx context.Context, target netip.Addr, o Options) results.Trace {
 		return tr
 	}
 	defer p.close()
-	tr.Method = p.name()
+	return run(ctx, target, o, p)
+}
+
+// run is Run with the prober supplied.
+func run(ctx context.Context, target netip.Addr, o Options, p prober) results.Trace {
+	tr := results.Trace{Target: target.String(), Cycles: o.Cycles, Method: p.name()}
 
 	type agg struct {
 		sent, recv int
@@ -114,6 +123,8 @@ func Run(ctx context.Context, target netip.Addr, o Options) results.Trace {
 		hops[i].mpls = map[string]bool{}
 	}
 	destTTL := o.MaxHops + 1
+	blockTTL, blockedBy := o.MaxHops+1, ""
+	sendErr, anySent := "", false
 	for c := 0; c < o.Cycles && ctx.Err() == nil; c++ {
 		if c > 0 {
 			select {
@@ -121,13 +132,19 @@ func Run(ctx context.Context, target netip.Addr, o Options) results.Trace {
 			case <-time.After(o.Interval):
 			}
 		}
-		limit := min(o.MaxHops, destTTL)
+		limit := min(o.MaxHops, destTTL, blockTTL)
 		for _, r := range p.cycle(ctx, limit) {
 			if r.ttl < 1 || r.ttl > o.MaxHops {
 				continue
 			}
 			h := &hops[r.ttl]
+			if !r.ok && r.errMsg != "" {
+				// The probe was never sent: not a lost packet.
+				sendErr = r.errMsg
+				continue
+			}
 			h.sent++
+			anySent = true
 			if !r.ok {
 				continue
 			}
@@ -140,13 +157,18 @@ func Run(ctx context.Context, target netip.Addr, o Options) results.Trace {
 			if r.dest || r.from == target {
 				h.dest = true
 				destTTL = min(destTTL, r.ttl)
+			} else if r.blocked && r.ttl < blockTTL {
+				blockTTL, blockedBy = r.ttl, r.from.String()
 			}
 		}
 	}
-	last := min(o.MaxHops, destTTL)
+	if destTTL <= blockTTL {
+		blockedBy = "" // the destination answered at or before that hop
+	}
+	last := min(o.MaxHops, destTTL, blockTTL)
 	// Trim trailing silent hops after the last responder when the
 	// destination never answered.
-	if destTTL > o.MaxHops {
+	if destTTL > o.MaxHops && blockedBy == "" {
 		for last > 1 && hops[last].recv == 0 {
 			last--
 		}
@@ -195,7 +217,13 @@ func Run(ctx context.Context, target netip.Addr, o Options) results.Trace {
 	tr.LossFromHop, tr.RateLimitedHops = interpretLoss(tr.Hops)
 	sum := sha1.Sum([]byte(strings.Join(ids, ">")))
 	tr.Fingerprint = hex.EncodeToString(sum[:6])
-	if !tr.Reached && tr.Note == "" {
+	switch {
+	case tr.Reached:
+	case blockedBy != "":
+		tr.Note = fmt.Sprintf("%s (hop %d) refused the probes with an ICMP destination-unreachable, so the trace stops there; the destination was not reached", blockedBy, blockTTL)
+	case !anySent && sendErr != "":
+		tr.Note = "trace probes could not be sent: " + sendErr
+	default:
 		tr.Note = "the destination did not answer trace probes (commonly filtered); hops up to the last responder are shown"
 	}
 	return tr

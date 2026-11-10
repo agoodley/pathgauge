@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"testing"
+	"time"
 )
 
 func openTest(t *testing.T) *Store {
@@ -92,5 +93,40 @@ func TestFinishRunOwnershipAndState(t *testing.T) {
 
 	if finish("no-such-run", "agent-a", "x") {
 		t.Error("finishing a run that does not exist reported success")
+	}
+}
+
+// Databases written before latency became nullable hold zeros for
+// intervals with no answers; the migration clears them.
+func TestMigrationClearsLatencyOfOutageSamples(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	// Put the database back to how version 1 left it.
+	if _, err := s.DB.ExecContext(ctx, `DELETE FROM schema_version WHERE v > 1`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB.ExecContext(ctx, `INSERT INTO monitor_samples(agent_id,ts,rtt_min,rtt_p50,rtt_p95,rtt_max,jitter,loss_pct,sent) VALUES
+		('a',100,0,0,0,0,0,100,50), ('a',160,5,6,7,8,1,2,50)`); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	s, err = Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ss, err := s.Samples(ctx, "a", time.Unix(0, 0), time.Unix(1000, 0), 1)
+	if err != nil || len(ss) != 2 {
+		t.Fatalf("samples: %v %+v", err, ss)
+	}
+	if ss[0].RTTP95 != nil || ss[0].Jitter != nil || ss[0].LossPct != 100 {
+		t.Errorf("the outage sample should have no latency after the migration: %+v", ss[0])
+	}
+	if ss[1].RTTP95 == nil || *ss[1].RTTP95 != 7 {
+		t.Errorf("the good sample must be untouched: %+v", ss[1])
 	}
 }

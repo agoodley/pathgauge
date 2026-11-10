@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"sync"
 	"time"
@@ -72,20 +73,32 @@ func RunVoIP(ctx context.Context, c *Client, vp VoIPParams) (*results.VoIP, erro
 		defer wg.Done()
 		p.run(callCtx, 10)
 	}()
+	var loadDown, loadUp *results.TCP
+	var errLoadDown, errLoadUp error
 	if vp.Load {
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			_, _ = RunTCP(ctx, c, TCPParams{Direction: results.Down, Streams: 4, Duration: vp.Duration})
+			loadDown, errLoadDown = RunTCP(ctx, c, TCPParams{Direction: results.Down, Streams: 4, Duration: vp.Duration})
 		}()
 		go func() {
 			defer wg.Done()
-			_, _ = RunTCP(ctx, c, TCPParams{Direction: results.Up, Streams: 4, Duration: vp.Duration})
+			loadUp, errLoadUp = RunTCP(ctx, c, TCPParams{Direction: results.Up, Streams: 4, Duration: vp.Duration})
 		}()
 	}
 	wg.Wait()
 	if errDown != nil {
 		return nil, errDown
+	}
+	if vp.Load {
+		// Without the load this was a call on an idle link.
+		err := loadErr("the download load", loadDown, errLoadDown)
+		if err == nil {
+			err = loadErr("the upload load", loadUp, errLoadUp)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("%w, so the call was not measured under load", err)
+		}
 	}
 	sleepCtx(ctx, 500*time.Millisecond)
 	var upSink flow.SinkResult

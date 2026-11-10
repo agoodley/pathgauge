@@ -113,15 +113,18 @@ export interface Run {
   bloat_grade: string;
   findings?: Finding[] | null;
   report?: Report | null;
+  /** The run is active but its agent has lost its connection; the test continues on the agent. */
+  agent_away?: boolean;
 }
 
+/** One monitoring interval. Latency is null when no probe was answered (an outage). */
 export interface Sample {
   ts: number;
-  rtt_min: number;
-  rtt_p50: number;
-  rtt_p95: number;
-  rtt_max: number;
-  jitter: number;
+  rtt_min: number | null;
+  rtt_p50: number | null;
+  rtt_p95: number | null;
+  rtt_max: number | null;
+  jitter: number | null;
   loss_pct: number;
   sent: number;
 }
@@ -129,7 +132,8 @@ export interface Sample {
 export interface HeatCell {
   weekday: number;
   hour: number;
-  rtt_p95: number;
+  /** null when no probe was answered in that hour */
+  rtt_p95: number | null;
   loss_pct: number;
   n: number;
 }
@@ -198,7 +202,7 @@ export interface OverviewLink {
   agent: Agent;
   last_run?: Run;
   latest_sample?: Sample;
-  spark_rtt_p95: number[];
+  spark_rtt_p95: (number | null)[];
   alerts_firing: number;
 }
 
@@ -928,7 +932,7 @@ export interface EngineEvent {
 
 export type LiveMessage =
   | { type: 'run_event'; run_id: string; agent_id: string; seq?: number; event: EngineEvent }
-  | { type: 'run_status'; run_id: string; agent_id?: string; status: RunStatus; error?: string; health_score?: number }
+  | { type: 'run_status'; run_id: string; agent_id?: string; status: RunStatus; error?: string; health_score?: number; agent_away?: boolean }
   | { type: 'agent_status'; agent_id: string; online: boolean }
   | { type: 'monitor'; agent_id: string; samples: Sample[] }
   | { type: 'alert'; state: 'firing' | 'resolved'; event: AlertEvent };

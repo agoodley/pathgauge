@@ -9,6 +9,7 @@ package results
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/agoodley/pathgauge/internal/hostinfo"
@@ -87,6 +88,13 @@ type Peer struct {
 	Software     string           `json:"software,omitempty"`
 	Host         *hostinfo.Report `json:"host,omitempty"`
 }
+
+// NoteCancelled marks a report whose run was stopped before it finished.
+const NoteCancelled = "run cancelled before completion"
+
+// Cancelled reports whether the run was stopped before it finished, so the
+// report holds only the steps that had run by then.
+func (r *Report) Cancelled() bool { return slices.Contains(r.Notes, NoteCancelled) }
 
 // Step is one test within a run.
 type Step struct {

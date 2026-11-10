@@ -46,7 +46,18 @@ type activeRun struct {
 	seq         int
 	events      []RunEvent // step events kept in full, progress events capped
 	progress    int
+	// away is when the agent's connection was lost; zero while it is
+	// connected. The run carries on running on the agent, which uploads
+	// the result (or reclaims the run) when it is back.
+	away time.Time
+	// unclaimed is when the agent came back without this run. A result it
+	// finished while away may still follow; if none does, the run is lost.
+	unclaimed time.Time
 }
+
+// unclaimedGrace is how long a run waits for its result after the agent
+// reconnected without it.
+var unclaimedGrace = time.Minute
 
 // RunEvent is one buffered engine event of an active run.
 type RunEvent struct {
@@ -135,22 +146,9 @@ func (h *Hub) handleAgent(w http.ResponseWriter, r *http.Request) {
 	_ = json.Unmarshal(hello.Data, &hp)
 	h.s.store.AgentSeen(ctx, id, hp.Version, r.RemoteAddr, hp.Host, hp.Policy)
 
-	h.mu.Lock()
-	if old := h.agents[id]; old != nil {
-		old.cancel()
-	}
-	h.agents[id] = conn
-	h.mu.Unlock()
+	abandoned := h.attach(conn, hp.RunID)
 	defer func() {
-		h.mu.Lock()
-		if h.agents[id] == conn {
-			delete(h.agents, id)
-		}
-		busy := conn.busy
-		h.mu.Unlock()
-		if busy != "" {
-			h.failRun(busy, "agent disconnected during the run")
-		}
+		h.detach(conn)
 		h.broadcast(map[string]any{"type": "agent_status", "agent_id": id, "online": false})
 		h.s.log.Info("agent disconnected", "agent", a.Name)
 	}()
@@ -161,6 +159,13 @@ func (h *Hub) handleAgent(w http.ResponseWriter, r *http.Request) {
 	conn.send <- agentproto.Msg{Type: agentproto.TypeWelcome, Data: mustJSON(agentproto.Welcome{
 		DataPort: h.s.DataPort(), DataHost: advHost, MonitorEnabled: a.MonitorEnabled, MonitorInterval: a.MonitorInterval, ServerVersion: version.Get().Version,
 	})}
+	if abandoned != "" {
+		// The agent is still working on a run the server has given up on
+		// (timed out, cancelled, or the server restarted): stop it, or it
+		// keeps loading the link and refuses the next run as busy.
+		h.s.log.Warn("agent is working on a run that is no longer active; cancelling it there", "agent", a.Name, "run", abandoned)
+		conn.send <- agentproto.Msg{Type: agentproto.TypeCancel, RunID: abandoned}
+	}
 
 	go func() {
 		defer func() {
@@ -199,6 +204,75 @@ func (h *Hub) handleAgent(w http.ResponseWriter, r *http.Request) {
 		}
 		h.safeAgentMsg(ctx, id, m)
 	}
+}
+
+// attach makes conn the agent's connection. claimed is the run the agent
+// says it is still working on (it kept going while disconnected). attach
+// returns that run's ID if the server no longer has it active, so the
+// caller can tell the agent to stop.
+func (h *Hub) attach(conn *agentConn, claimed string) (abandoned string) {
+	var resumed, orphaned []string
+	h.mu.Lock()
+	if old := h.agents[conn.id]; old != nil {
+		old.cancel()
+	}
+	h.agents[conn.id] = conn
+	for _, ar := range h.runs {
+		if ar.agentID != conn.id {
+			continue
+		}
+		if ar.id == claimed {
+			ar.away, ar.unclaimed = time.Time{}, time.Time{}
+			conn.busy = ar.id
+			resumed = append(resumed, ar.id)
+		} else if ar.unclaimed.IsZero() {
+			// The agent is back and not working on this run. It may have
+			// finished it while away (the result follows) or lost it.
+			ar.unclaimed = time.Now()
+			orphaned = append(orphaned, ar.id)
+		}
+	}
+	h.mu.Unlock()
+	for _, id := range resumed {
+		h.s.log.Info("agent is back and still running its test", "agent", conn.id, "run", id)
+		h.broadcast(map[string]any{"type": "run_status", "run_id": id, "agent_id": conn.id, "status": "running"})
+	}
+	for _, id := range orphaned {
+		h.s.log.Info("agent is back without its run; waiting for a result it may have kept", "agent", conn.id, "run", id)
+	}
+	if claimed != "" && len(resumed) == 0 {
+		return claimed
+	}
+	return ""
+}
+
+// detach is called when conn ends. A run the agent was working on stays
+// active: losing the control connection does not stop the test, and the
+// agent uploads the result or reclaims the run when it reconnects. The
+// run's own timeout still applies.
+func (h *Hub) detach(conn *agentConn) {
+	var away string
+	h.mu.Lock()
+	if h.agents[conn.id] == conn { // not already replaced by a newer connection
+		delete(h.agents, conn.id)
+		if ar := h.runs[conn.busy]; ar != nil && ar.agentID == conn.id {
+			ar.away = time.Now()
+			away = ar.id
+		}
+	}
+	h.mu.Unlock()
+	if away != "" {
+		h.s.log.Warn("agent disconnected during a run; the run continues on the agent", "agent", conn.id, "run", away)
+		h.broadcast(map[string]any{"type": "run_status", "run_id": away, "agent_id": conn.id, "status": "running", "agent_away": true})
+	}
+}
+
+// AgentAway reports whether runID is active while its agent is disconnected.
+func (h *Hub) AgentAway(runID string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	ar := h.runs[runID]
+	return ar != nil && !ar.away.IsZero()
 }
 
 // safeAgentMsg handles one message; a panic while handling it costs that
@@ -270,7 +344,8 @@ var (
 
 // StartRun asks an agent to run a profile against the server.
 func (h *Hub) StartRun(ctx context.Context, agentID string, req agentproto.RunRequest, trigger, by string) (string, error) {
-	if _, err := (engine.Options{Profile: req.Profile, Tests: req.Tests}).TestList(); err != nil {
+	tests, err := (engine.Options{Profile: req.Profile, Tests: req.Tests}).TestList()
+	if err != nil {
 		return "", err
 	}
 	if req.Mix != "" {
@@ -294,7 +369,7 @@ func (h *Hub) StartRun(ctx context.Context, agentID string, req agentproto.RunRe
 	}
 	id := engine.NewRunID()
 	conn.busy = id
-	timeout := runTimeout(req)
+	timeout := runTimeout(req, tests)
 	h.runs[id] = &activeRun{id: id, agentID: agentID, started: time.Now(), timeout: timeout}
 	h.mu.Unlock()
 
@@ -325,36 +400,48 @@ func (h *Hub) StartRun(ctx context.Context, agentID string, req agentproto.RunRe
 	return id, nil
 }
 
-// runTimeout bounds how long a run may take before it is failed.
-func runTimeout(req agentproto.RunRequest) time.Duration {
+// runTimeout bounds how long a run may take before it is failed and
+// cancelled on the agent. Tests whose length the request sets (groups and
+// CDP replication) add their time on top of the profile's allowance, which
+// would otherwise be shorter than the run that was asked for.
+func runTimeout(req agentproto.RunRequest, tests []string) time.Duration {
 	base := map[string]time.Duration{"quick": 5 * time.Minute, "standard": 15 * time.Minute, "full": 45 * time.Minute}[req.Profile]
 	if base == 0 || len(req.Tests) > 0 {
 		base = 45 * time.Minute
 	}
-	if req.Scale > 1 {
-		base = time.Duration(float64(base) * req.Scale)
+	scale := max(req.Scale, 1)
+	base = time.Duration(float64(base) * scale)
+	seconds := func(s float64) time.Duration { return time.Duration(s * float64(time.Second)) }
+	var extra time.Duration
+	for _, t := range tests {
+		switch {
+		case engine.IsGroup(t):
+			d := max(15*time.Second, time.Duration(30*scale*float64(time.Second)))
+			if req.GroupDurationS > 0 {
+				d = seconds(req.GroupDurationS)
+			}
+			runs := 1 // together
+			if !req.NoBaseline {
+				runs += len(engine.GroupMembers(t)) // and each on its own first
+			}
+			extra += time.Duration(runs) * d
+		case strings.HasPrefix(t, "cdp-") && req.CDP != nil && req.CDP.DurationS > 0:
+			extra += seconds(req.CDP.DurationS)
+		}
 	}
-	return base
+	// Half as much again for setup, draining and result collection.
+	return base + extra*3/2
 }
 
 // CancelRun asks the agent to stop.
 func (h *Hub) CancelRun(runID string) error {
 	h.mu.Lock()
 	ar := h.runs[runID]
-	var conn *agentConn
-	if ar != nil {
-		conn = h.agents[ar.agentID]
-	}
 	h.mu.Unlock()
 	if ar == nil {
 		return errors.New("run is not active")
 	}
-	if conn != nil {
-		select {
-		case conn.send <- agentproto.Msg{Type: agentproto.TypeCancel, RunID: runID}:
-		default:
-		}
-	}
+	h.cancelOnAgent(ar.agentID, runID)
 	_ = h.s.store.SetRunStatus(context.Background(), runID, "cancelled", "cancelled by user")
 	h.release(ar.agentID, runID)
 	h.broadcast(map[string]any{"type": "run_status", "run_id": runID, "status": "cancelled"})
@@ -407,6 +494,16 @@ func (h *Hub) finishRun(ctx context.Context, agentID, runID string, data json.Ra
 		}
 		return
 	}
+	if rep.Cancelled() {
+		// Agents up to 0.1.0-rc.6 cancelled the test when they lost the control
+		// connection and uploaded what they had. A run cut short is not a
+		// result: the tests that never ran would read as "no problems".
+		h.s.log.Warn("ignored the partial result of a run that was cut short on the agent", "agent", agentID, "run", runID)
+		if ar != nil {
+			h.failRun(runID, "the run was cut short on the agent (it lost its connection or was stopped), so its partial result was discarded")
+		}
+		return
+	}
 	a, _ := h.s.store.Agent(ctx, agentID)
 	analysis.Analyze(&rep, analysis.Expectations{DownMbps: a.ExpectedDown, UpMbps: a.ExpectedUp})
 	rep.ID = runID
@@ -421,8 +518,9 @@ func (h *Hub) finishRun(ctx context.Context, agentID, runID string, data json.Ra
 		return
 	}
 	if !stored {
-		// Not this agent's run, or already done or cancelled.
-		h.s.log.Warn("ignored a result for a run this agent can't finish", "agent", agentID, "run", runID)
+		// Not this agent's run, or already done or cancelled (which
+		// includes a result sent twice after a reconnect).
+		h.s.log.Info("ignored a result: the run is not this agent's, or is already finished or cancelled", "agent", agentID, "run", runID)
 		return
 	}
 	h.s.log.Info("run finished", "run", runID, "agent", a.Name, "health", rep.Summary.HealthScore)
@@ -430,7 +528,7 @@ func (h *Hub) finishRun(ctx context.Context, agentID, runID string, data json.Ra
 	h.s.alerts.onRun(ctx, agentID, &rep)
 }
 
-// watchdog fails runs that exceed their timeout.
+// watchdog ends runs the server gives up on.
 func (h *Hub) watchdog(ctx context.Context) {
 	t := time.NewTicker(30 * time.Second)
 	defer t.Stop()
@@ -440,17 +538,45 @@ func (h *Hub) watchdog(ctx context.Context) {
 			return
 		case <-t.C:
 		}
-		h.mu.Lock()
-		var expired []string
-		for id, r := range h.runs {
-			if time.Since(r.started) > r.timeout {
-				expired = append(expired, id)
-			}
+		h.sweep(time.Now())
+	}
+}
+
+// sweep fails runs that have exceeded their timeout, and runs whose agent
+// came back without them and sent no result. A run that timed out is also
+// cancelled on the agent: otherwise it would keep loading the link and
+// refuse the next run as busy.
+func (h *Hub) sweep(now time.Time) {
+	type gone struct{ id, agentID, why string }
+	var expired []gone
+	h.mu.Lock()
+	for id, r := range h.runs {
+		switch {
+		case now.Sub(r.started) > r.timeout:
+			expired = append(expired, gone{id, r.agentID, "run timed out"})
+		case !r.unclaimed.IsZero() && now.Sub(r.unclaimed) > unclaimedGrace:
+			expired = append(expired, gone{id, r.agentID, "the agent stopped working on this run and sent no result (it was restarted, or the run failed while it was disconnected)"})
 		}
-		h.mu.Unlock()
-		for _, id := range expired {
-			h.failRun(id, "run timed out")
-		}
+	}
+	h.mu.Unlock()
+	for _, g := range expired {
+		h.cancelOnAgent(g.agentID, g.id)
+		h.failRun(g.id, g.why)
+	}
+}
+
+// cancelOnAgent tells the agent to stop a run, if it is connected. If it
+// is not, it is told when it reconnects still working on the run (attach).
+func (h *Hub) cancelOnAgent(agentID, runID string) {
+	h.mu.Lock()
+	conn := h.agents[agentID]
+	h.mu.Unlock()
+	if conn == nil {
+		return
+	}
+	select {
+	case conn.send <- agentproto.Msg{Type: agentproto.TypeCancel, RunID: runID}:
+	default:
 	}
 }
 
@@ -468,11 +594,22 @@ func (h *Hub) sendConfig(a store.Agent) {
 	}
 }
 
-// disconnect drops an agent (after revocation).
+// disconnect drops an agent (after revocation) and ends its runs: unlike
+// an agent that lost its connection, it will not be back to finish them.
 func (h *Hub) disconnect(id string) {
 	h.mu.Lock()
 	conn := h.agents[id]
+	var runs []string
+	for rid, ar := range h.runs {
+		if ar.agentID == id {
+			runs = append(runs, rid)
+		}
+	}
 	h.mu.Unlock()
+	for _, rid := range runs {
+		h.cancelOnAgent(id, rid) // best effort: the connection closes next
+		h.failRun(rid, "the agent was revoked or deleted during the run")
+	}
 	if conn != nil {
 		conn.cancel()
 	}
