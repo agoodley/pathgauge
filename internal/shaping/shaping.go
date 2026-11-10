@@ -10,6 +10,9 @@
 //     unless Force is set, because restoring means deleting the qdisc and
 //     letting the kernel re-attach its default.
 //   - Every tc command is recorded and returned, so what was done is visible.
+//   - A lease is forgotten only once its shaping is confirmed gone. Removal
+//     never depends on the caller's context, because the usual reason to
+//     remove shaping is that the run using it was cancelled.
 package shaping
 
 import (
@@ -18,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -85,13 +89,27 @@ func NewManager(log *slog.Logger) *Manager {
 	return m
 }
 
+// leaseFile picks where the lease is recorded. /run/pathgauge is the
+// services' RuntimeDirectory, which outlives a crash and a restart; the
+// temp directory is the fallback for a command run by hand. (Under the
+// packaged units the temp directory is private and deleted on every stop,
+// so it is no use for crash recovery there.)
 func leaseFile() string {
 	for _, dir := range []string{"/run/pathgauge", filepath.Join(os.TempDir(), "pathgauge")} {
-		if err := os.MkdirAll(dir, 0o750); err == nil {
+		if err := os.MkdirAll(dir, 0o750); err == nil && writable(dir) {
 			return filepath.Join(dir, "shaping-lease.json")
 		}
 	}
 	return filepath.Join(os.TempDir(), "pathgauge-shaping-lease.json")
+}
+
+func writable(dir string) bool {
+	f, err := os.CreateTemp(dir, ".probe-*")
+	if err != nil {
+		return false
+	}
+	_ = f.Close()
+	return os.Remove(f.Name()) == nil
 }
 
 func runCmd(ctx context.Context, name string, args ...string) (string, error) {
@@ -125,30 +143,55 @@ func (m *Manager) cleanupStale() {
 		return
 	}
 	var l lease
-	if json.Unmarshal(b, &l) == nil && l.Interface != "" {
-		m.log.Warn("removing shaping left by a previous run", "interface", l.Interface)
-		m.remove(context.Background(), &l)
+	if json.Unmarshal(b, &l) != nil || l.Interface == "" {
+		_ = os.Remove(m.file)
+		return
 	}
-	_ = os.Remove(m.file)
+	m.log.Warn("removing shaping left by a previous run", "interface", l.Interface)
+	// Adopt the old lease, so a removal that fails now is retried and the
+	// file stays until the shaping is gone.
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.cur = &l
+	_ = m.clearLocked()
 }
 
-// Apply implements endpoint.Shaper.
-func (m *Manager) Apply(ctx context.Context, raw json.RawMessage) (any, error) {
+// Apply implements endpoint.Shaper: a request from a remote client. The
+// client's choice of interface and its force flag are ignored: the
+// interface is the one that routes to the client, and a qdisc the host's
+// owner configured is never replaced on a remote request.
+func (m *Manager) Apply(ctx context.Context, raw json.RawMessage, client netip.Addr) (any, error) {
 	var s Spec
 	if err := json.Unmarshal(raw, &s); err != nil {
 		return nil, err
 	}
+	if !client.IsValid() {
+		return nil, errors.New("the client's address is unknown")
+	}
+	s.Interface, s.Target, s.Force = "", client.Unmap().String(), false
 	return m.ApplySpec(ctx, s)
 }
 
-// Clear implements endpoint.Shaper.
-func (m *Manager) Clear(ctx context.Context) error {
+// Clear removes the active lease's shaping, if any. It implements
+// endpoint.Shaper.
+//
+// The context is not used: shaping is removed when a run ends or is
+// cancelled, which is when the run's context is already dead, and tc must
+// still run then. Each removal has its own time limit instead.
+func (m *Manager) Clear(_ context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.clearLocked(ctx)
+	return m.clearLocked()
 }
 
-func (m *Manager) clearLocked(ctx context.Context) error {
+// removeTimeout bounds the commands that take shaping off an interface.
+const removeTimeout = 15 * time.Second
+
+// retryDelay is how long to wait before trying again to remove shaping
+// that could not be removed.
+var retryDelay = 30 * time.Second
+
+func (m *Manager) clearLocked() error {
 	if m.timer != nil {
 		m.timer.Stop()
 		m.timer = nil
@@ -156,19 +199,45 @@ func (m *Manager) clearLocked(ctx context.Context) error {
 	if m.cur == nil {
 		return nil
 	}
-	m.remove(ctx, m.cur)
-	m.log.Info("shaping removed", "interface", m.cur.Interface)
+	iface := m.cur.Interface
+	if err := m.remove(m.cur); err != nil {
+		// Keep the lease and its file. Forgetting shaping that is still on
+		// the interface would leave nothing to remove it later.
+		m.log.Error("could not remove shaping; it stays recorded and removal will be retried", "interface", iface, "err", err, "retry_in", retryDelay)
+		m.timer = time.AfterFunc(retryDelay, func() { _ = m.Clear(context.Background()) })
+		return fmt.Errorf("shaping is still applied on %s: %w", iface, err)
+	}
+	m.log.Info("shaping removed", "interface", iface)
 	m.cur = nil
 	_ = os.Remove(m.file)
 	return nil
 }
 
-func (m *Manager) remove(ctx context.Context, l *lease) {
+// remove takes a lease's shaping off its interface and checks that it is
+// gone. The delete commands fail harmlessly when there is nothing left to
+// delete, so the result is judged by what is on the interface afterwards.
+func (m *Manager) remove(l *lease) error {
+	ctx, cancel := context.WithTimeout(context.Background(), removeTimeout)
+	defer cancel()
 	_, _ = m.run(ctx, "tc", "qdisc", "del", "dev", l.Interface, "root")
 	if l.Ingress {
+		// The ingress qdisc goes before the IFB device: a redirect to a
+		// device that no longer exists drops everything that arrives.
 		_, _ = m.run(ctx, "tc", "qdisc", "del", "dev", l.Interface, "ingress")
 		_, _ = m.run(ctx, "ip", "link", "del", IFB)
 	}
+	kind, handle, hasIngress, err := m.rootQdisc(ctx, l.Interface)
+	switch {
+	case err != nil && strings.Contains(err.Error(), "Cannot find device"):
+		return nil // the interface itself is gone, and its qdiscs with it
+	case err != nil:
+		return fmt.Errorf("cannot check that the shaping is gone: %w", err)
+	case handle == Handle:
+		return fmt.Errorf("the %s qdisc with handle %s is still the root qdisc", kind, handle)
+	case l.Ingress && hasIngress:
+		return errors.New("the ingress redirect is still in place")
+	}
+	return nil
 }
 
 // RouteInterface returns the interface used to reach an address.
@@ -228,7 +297,7 @@ func (m *Manager) ApplySpec(ctx context.Context, s Spec) (Applied, error) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if err := m.clearLocked(ctx); err != nil {
+	if err := m.clearLocked(); err != nil {
 		return Applied{}, err
 	}
 	iface := s.Interface
@@ -255,13 +324,17 @@ func (m *Manager) ApplySpec(ctx context.Context, s Spec) (Applied, error) {
 		return Applied{}, fmt.Errorf("interface %s already has an ingress qdisc; refusing without force", iface)
 	}
 	l := &lease{Interface: iface, Expires: time.Now().Add(time.Duration(s.LeaseSeconds) * time.Second)}
-	// Record the lease before changing anything, so a crash mid-way is cleaned up.
+	// Record the lease before changing anything, so a crash mid-way is
+	// cleaned up. Without the record there is no crash cleanup, so no shaping.
 	m.cur = l
-	m.writeLease()
-	cmdErr := func(err error) (Applied, error) {
-		m.remove(context.Background(), l)
+	if err := m.writeLease(); err != nil {
 		m.cur = nil
-		_ = os.Remove(m.file)
+		return Applied{}, fmt.Errorf("cannot record the shaping lease, so shaping could not be undone after a crash: %w", err)
+	}
+	cmdErr := func(err error) (Applied, error) {
+		// Undo whatever was applied. If that fails too, the lease stays
+		// recorded and removal is retried.
+		_ = m.clearLocked()
 		return Applied{}, err
 	}
 	exec := func(name string, args ...string) error {
@@ -285,7 +358,9 @@ func (m *Manager) ApplySpec(ctx context.Context, s Spec) (Applied, error) {
 	}
 	if s.IngressRateMbps > 0 {
 		l.Ingress = true
-		m.writeLease()
+		if err := m.writeLease(); err != nil {
+			return cmdErr(fmt.Errorf("cannot record the shaping lease: %w", err))
+		}
 		_, _ = m.run(ctx, "ip", "link", "del", IFB)
 		steps := [][]string{
 			{"ip", "link", "add", IFB, "type", "ifb"},
@@ -302,7 +377,7 @@ func (m *Manager) ApplySpec(ctx context.Context, s Spec) (Applied, error) {
 			return cmdErr(err)
 		}
 	}
-	m.writeLease()
+	_ = m.writeLease() // only adds the command list; the lease itself is already recorded
 	m.timer = time.AfterFunc(time.Until(l.Expires), func() {
 		m.log.Info("shaping lease expired", "interface", iface)
 		_ = m.Clear(context.Background())
@@ -354,12 +429,15 @@ func (m *Manager) applyRoot(exec func(string, ...string) error, dev, qdisc strin
 	}
 }
 
-func (m *Manager) writeLease() {
+func (m *Manager) writeLease() error {
 	if m.cur == nil {
-		return
+		return nil
 	}
-	b, _ := json.Marshal(m.cur)
-	_ = os.WriteFile(m.file, b, 0o600)
+	b, err := json.Marshal(m.cur)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(m.file, b, 0o600)
 }
 
 // Active reports the current lease, if any.

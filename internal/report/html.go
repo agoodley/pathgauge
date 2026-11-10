@@ -252,7 +252,7 @@ func section(r *results.Report, s results.Step) template.HTML {
 			{"Outbound", f2(v.Up.MOS), f1(v.Up.R), f2(v.Up.Loss.LossPct), f2(v.Up.LateLossPct), f2(v.Up.JitterMs), v.Up.Verdict},
 			{"Return", f2(v.Down.MOS), f1(v.Down.R), f2(v.Down.Loss.LossPct), f2(v.Down.LateLossPct), f2(v.Down.JitterMs), v.Down.Verdict},
 		})
-		fmt.Fprintf(&b, `<p class="muted">%s for %.0f s%s; one-way network delay ≈ %.1f ms.</p>`, v.Codec, v.DurationS, map[bool]string{true: " while both directions were saturated", false: ""}[v.Loaded], v.OneWayMs)
+		fmt.Fprintf(&b, `<p class="muted">%s for %.0f s%s; one-way network delay ≈ %.1f ms.</p>`, html.EscapeString(v.Codec), v.DurationS, map[bool]string{true: " while both directions were saturated", false: ""}[v.Loaded], v.OneWayMs)
 	case *results.Sweep:
 		sweepSection(&b, v, s.ID)
 	case *results.SizeSweep:
@@ -369,7 +369,7 @@ func virt(v string) string {
 	if v == "" {
 		return ""
 	}
-	return ", " + v
+	return ", " + html.EscapeString(v)
 }
 
 func latencySection(b *strings.Builder, v *results.Latency) {
@@ -471,7 +471,7 @@ func bloatSection(b *strings.Builder, v *results.Bufferbloat, id string) {
 		rows = append(rows, []string{labels[ph.Name], f2(ph.RTT.Median), f2(ph.RTT.P95), f2(ph.InFlowRTT.Median), f2(ph.Connect.Median), inc, g, fmtMbps(ph.DownMbps), fmtMbps(ph.UpMbps)})
 	}
 	table(b, []string{"Phase", "Probe RTT median", "Probe RTT p95", "In-flow RTT median", "TCP connect", "Increase (p95)", "Grade", "Download", "Upload"}, rows)
-	fmt.Fprintf(b, `<p>Overall grade <b>%s</b>; responsiveness %.0f RPM (working latency %.1f ms); queue behaviour: %s.</p>`, v.Grade, v.RPM, v.WorkingLatency, html.EscapeString(v.Queueing))
+	fmt.Fprintf(b, `<p>Overall grade <b>%s</b>; responsiveness %.0f RPM (working latency %.1f ms); queue behaviour: %s.</p>`, html.EscapeString(v.Grade), v.RPM, v.WorkingLatency, html.EscapeString(v.Queueing))
 }
 
 func traceSection(b *strings.Builder, v *results.Trace) {
@@ -503,7 +503,7 @@ func traceSection(b *strings.Builder, v *results.Trace) {
 		}
 		rows = append(rows, []string{fmt.Sprint(h.TTL), addr, name, fmt.Sprintf("%.1f", h.LossPct), f2(h.RTT.Min), f2(h.RTT.Median), f2(h.RTT.Max), strings.Join(flags, ", ")})
 	}
-	fmt.Fprintf(b, `<p class="muted">From %s to %s, method %s, %d cycle(s), fingerprint %s.</p>`, html.EscapeString(v.From), html.EscapeString(v.Target), html.EscapeString(v.Method), v.Cycles, v.Fingerprint)
+	fmt.Fprintf(b, `<p class="muted">From %s to %s, method %s, %d cycle(s), fingerprint %s.</p>`, html.EscapeString(v.From), html.EscapeString(v.Target), html.EscapeString(v.Method), v.Cycles, html.EscapeString(v.Fingerprint))
 	table(b, []string{"Hop", "Address", "Name / network", "Loss %", "Best ms", "Median ms", "Worst ms", "Notes"}, rows)
 	if v.Note != "" {
 		fmt.Fprintf(b, `<p class="muted">%s.</p>`, html.EscapeString(v.Note))
@@ -581,7 +581,7 @@ func sqmSection(b *strings.Builder, v *results.SQMTuner) {
 	b.WriteString(string(LineChart{Title: "Latency increase under load at each shaping rate", XLabel: "shaped rate (% of measured capacity)", YLabel: "ms (p95 increase)", Series: []Series{{Name: "latency increase", X: pct, Y: inc, Slot: 1}}, YZero: true, Height: 200}.SVG()))
 	table(b, []string{"Shaped to", "Qdisc", "Shaped Mbit/s (down / up)", "Measured Mbit/s", "Increase ms", "Grade", "Error"}, rows)
 	if v.Recommended != nil {
-		fmt.Fprintf(b, `<p>Recommended: <b>%.0f%%</b> (%.1f / %.1f Mbit/s) with %s, grade %s.</p>`, v.Recommended.Percent, v.Recommended.DownMbps, v.Recommended.UpMbps, html.EscapeString(v.Recommended.Qdisc), v.Recommended.Grade)
+		fmt.Fprintf(b, `<p>Recommended: <b>%.0f%%</b> (%.1f / %.1f Mbit/s) with %s, grade %s.</p>`, v.Recommended.Percent, v.Recommended.DownMbps, v.Recommended.UpMbps, html.EscapeString(v.Recommended.Qdisc), html.EscapeString(v.Recommended.Grade))
 	}
 	if len(v.TCCommands) > 0 {
 		fmt.Fprintf(b, `<pre>%s</pre>`, html.EscapeString(strings.Join(v.TCCommands, "\n")))

@@ -19,8 +19,8 @@ import (
 
 	"github.com/agoodley/pathgauge/internal/config"
 	"github.com/agoodley/pathgauge/internal/endpoint"
+	"github.com/agoodley/pathgauge/internal/guard"
 	"github.com/agoodley/pathgauge/internal/pki"
-	"github.com/agoodley/pathgauge/internal/shaping"
 	"github.com/agoodley/pathgauge/internal/store"
 )
 
@@ -147,11 +147,10 @@ func (s *Server) Run(ctx context.Context) error {
 		}
 		pol = p
 	}
-	var shaper endpoint.Shaper
-	if pol.Shaping != config.ShapingNone {
-		shaper = shaping.NewManager(s.log)
-	}
-	s.ep = endpoint.New(endpoint.Options{Listen: s.cfg.DataPlane.Listen, Keys: s, Policy: pol, Logger: s.log.With("component", "endpoint"), Shaper: shaper})
+	// The server's endpoint takes no shaping requests: every enrolled agent
+	// can open a session to it, and none of them should be able to shape
+	// the server's interfaces. The SQM tuner shapes the agent's own host.
+	s.ep = endpoint.New(endpoint.Options{Listen: s.cfg.DataPlane.Listen, Keys: s, Policy: pol, Logger: s.log.With("component", "endpoint")})
 	if err := s.ep.Listen(); err != nil {
 		return err
 	}
@@ -178,10 +177,12 @@ func (s *Server) Run(ctx context.Context) error {
 	s.addr = ln.Addr()
 	close(s.ready)
 	go func() { errc <- s.http.Serve(tls.NewListener(ln, tlsCfg)) }()
-	go s.sched.Run(ctx)
-	go s.alerts.Run(ctx)
-	go s.hub.watchdog(ctx)
-	go s.housekeeping(ctx)
+	// Background loops restart if a bug panics them, so one bad row or
+	// message does not end the server.
+	go guard.Loop(ctx, s.log, "scheduler", s.sched.Run)
+	go guard.Loop(ctx, s.log, "alert evaluation", s.alerts.Run)
+	go guard.Loop(ctx, s.log, "run watchdog", s.hub.watchdog)
+	go guard.Loop(ctx, s.log, "housekeeping", s.housekeeping)
 	s.log.Info("server ready", "dashboard", "https://"+displayAddr(s.cfg.Listen), "data_plane", s.ep.Addr().String(), "ca_fingerprint", s.ca.Fingerprint()[:16])
 	select {
 	case <-ctx.Done():

@@ -18,6 +18,14 @@ LimitNOFILE=65536
 StateDirectory=pathgauge
 StateDirectoryMode=0750
 
+# /run/pathgauge holds the record of any shaping the SQM tuner has applied.
+# It is kept when the service stops or crashes, so the next start finds the
+# record and removes the shaping. (/tmp is private to the service and
+# deleted on every stop, so it can't hold this.)
+RuntimeDirectory=pathgauge
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+
 # Only the network capabilities testing needs; the service never runs as root.
 #   CAP_NET_RAW:   ICMP probes, TCP-SYN traceroute, packet capture
 #   CAP_NET_ADMIN: tc shaping (inherited by /usr/sbin/tc), SO_MARK, forced socket buffers

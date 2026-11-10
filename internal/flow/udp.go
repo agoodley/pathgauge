@@ -45,6 +45,10 @@ type PacketLog struct {
 	RxUs   []int64  `json:"rx_us"`
 }
 
+// maxSinkBins bounds the time bins of one stream (about 29 hours of 100 ms
+// bins, or 2.9 hours of the smallest, 10 ms).
+const maxSinkBins = 1 << 20
+
 // maxLogPackets bounds the packet log (about 4 MB of JSON).
 const maxLogPackets = 200_000
 
@@ -112,7 +116,17 @@ func (s *UDPSink) Add(h proto.UDPHeader, size int, rx time.Time, ri netx.RecvInf
 	if ri.TTL >= 0 {
 		s.ttl[ri.TTL]++
 	}
+	// Arrival times are wall-clock, so the clock can step while a stream is
+	// running: backwards puts a packet before the first one, forwards puts
+	// it hours ahead. Neither may index outside the bins or grow them
+	// without limit; totals above still count the packet.
 	idx := int(rx.Sub(s.first) / s.binDur)
+	if rx.Before(s.first) {
+		idx = 0
+	}
+	if idx >= maxSinkBins {
+		return
+	}
 	for len(s.bins) <= idx {
 		s.bins = append(s.bins, sinkBin{owdMin: math.Inf(1)})
 	}

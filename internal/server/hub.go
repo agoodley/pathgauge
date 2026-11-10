@@ -16,6 +16,7 @@ import (
 	"github.com/agoodley/pathgauge/internal/agentproto"
 	"github.com/agoodley/pathgauge/internal/analysis"
 	"github.com/agoodley/pathgauge/internal/engine"
+	"github.com/agoodley/pathgauge/internal/guard"
 	"github.com/agoodley/pathgauge/internal/results"
 	"github.com/agoodley/pathgauge/internal/store"
 	"github.com/agoodley/pathgauge/internal/version"
@@ -162,6 +163,11 @@ func (h *Hub) handleAgent(w http.ResponseWriter, r *http.Request) {
 	})}
 
 	go func() {
+		defer func() {
+			if guard.Recovered(h.s.log, "agent connection writer", recover()) {
+				cancel()
+			}
+		}()
 		ping := time.NewTicker(30 * time.Second)
 		defer ping.Stop()
 		for {
@@ -191,8 +197,24 @@ func (h *Hub) handleAgent(w http.ResponseWriter, r *http.Request) {
 			ws.Close(websocket.StatusNormalClosure, "")
 			return
 		}
-		h.handleAgentMsg(ctx, id, m)
+		h.safeAgentMsg(ctx, id, m)
 	}
+}
+
+// safeAgentMsg handles one message; a panic while handling it costs that
+// message, not the agent's connection.
+func (h *Hub) safeAgentMsg(ctx context.Context, agentID string, m agentproto.Msg) {
+	defer func() { guard.Recovered(h.s.log, "agent message", recover()) }()
+	h.handleAgentMsg(ctx, agentID, m)
+}
+
+// ownsActive reports whether runID is an active run given to this agent.
+// An agent may only report on its own runs.
+func (h *Hub) ownsActive(agentID, runID string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	ar := h.runs[runID]
+	return ar != nil && ar.agentID == agentID
 }
 
 func mustJSON(v any) json.RawMessage {
@@ -204,16 +226,19 @@ func (h *Hub) handleAgentMsg(ctx context.Context, agentID string, m agentproto.M
 	switch m.Type {
 	case agentproto.TypeEvent:
 		h.mu.Lock()
-		seq := 0
-		if ar := h.runs[m.RunID]; ar != nil {
-			ar.seq++
-			seq = ar.seq
-			isProgress := strings.Contains(string(m.Data), `"type":"progress"`)
-			if !isProgress || ar.progress < maxProgressEvents {
-				ar.events = append(ar.events, RunEvent{Seq: seq, Event: m.Data})
-				if isProgress {
-					ar.progress++
-				}
+		ar := h.runs[m.RunID]
+		if ar == nil || ar.agentID != agentID {
+			// Not an active run of this agent: nothing to show it on.
+			h.mu.Unlock()
+			return
+		}
+		ar.seq++
+		seq := ar.seq
+		isProgress := strings.Contains(string(m.Data), `"type":"progress"`)
+		if !isProgress || ar.progress < maxProgressEvents {
+			ar.events = append(ar.events, RunEvent{Seq: seq, Event: m.Data})
+			if isProgress {
+				ar.progress++
 			}
 		}
 		h.mu.Unlock()
@@ -221,6 +246,10 @@ func (h *Hub) handleAgentMsg(ctx context.Context, agentID string, m agentproto.M
 	case agentproto.TypeResult:
 		h.finishRun(ctx, agentID, m.RunID, m.Data)
 	case agentproto.TypeFailed:
+		if !h.ownsActive(agentID, m.RunID) {
+			h.s.log.Warn("ignored a failure report for a run that is not an active run of this agent", "agent", agentID, "run", m.RunID)
+			return
+		}
 		h.failRun(m.RunID, m.Error)
 	case agentproto.TypeMonitor:
 		var mon agentproto.Monitor
@@ -353,10 +382,29 @@ func (h *Hub) failRun(runID, msg string) {
 }
 
 func (h *Hub) finishRun(ctx context.Context, agentID, runID string, data json.RawMessage) {
+	// An agent reports only on its own runs. A run that is still active
+	// must be this agent's; one that is no longer active (a result held
+	// back by a disconnect) is checked against its owner in the database.
+	h.mu.Lock()
+	ar := h.runs[runID]
+	h.mu.Unlock()
+	if ar != nil && ar.agentID != agentID {
+		h.s.log.Warn("ignored a result for another agent's run", "agent", agentID, "run", runID)
+		return
+	}
 	defer h.release(agentID, runID)
+	// The analysis runs on whatever the agent sent. If it panics, the run
+	// is failed rather than left "running" for ever.
+	defer func() {
+		if guard.Recovered(h.s.log, "result of run "+runID, recover()) && ar != nil {
+			h.failRun(runID, "the server could not process the result (see the server log)")
+		}
+	}()
 	var rep results.Report
 	if err := json.Unmarshal(data, &rep); err != nil {
-		h.failRun(runID, "invalid result from agent: "+err.Error())
+		if ar != nil {
+			h.failRun(runID, "invalid result from agent: "+err.Error())
+		}
 		return
 	}
 	a, _ := h.s.store.Agent(ctx, agentID)
@@ -364,11 +412,17 @@ func (h *Hub) finishRun(ctx context.Context, agentID, runID string, data json.Ra
 	rep.ID = runID
 	b, _ := json.Marshal(&rep)
 	fj, _ := json.Marshal(rep.Findings)
-	if err := h.s.store.FinishRun(ctx, runID, b, store.RunSummary{
+	stored, err := h.s.store.FinishRun(ctx, runID, agentID, b, store.RunSummary{
 		HealthScore: rep.Summary.HealthScore, DownMbps: rep.Summary.DownMbps, UpMbps: rep.Summary.UpMbps,
 		RTTms: rep.Summary.IdleRTTms, BloatGrade: rep.Summary.BloatGrade, Findings: fj,
-	}); err != nil {
+	})
+	if err != nil {
 		h.s.log.Error("store run", "run", runID, "err", err)
+		return
+	}
+	if !stored {
+		// Not this agent's run, or already done or cancelled.
+		h.s.log.Warn("ignored a result for a run this agent can't finish", "agent", agentID, "run", runID)
 		return
 	}
 	h.s.log.Info("run finished", "run", runID, "agent", a.Name, "health", rep.Summary.HealthScore)

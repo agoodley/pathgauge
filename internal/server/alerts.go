@@ -17,6 +17,7 @@ import (
 	"github.com/robfig/cron/v3"
 
 	"github.com/agoodley/pathgauge/internal/agentproto"
+	"github.com/agoodley/pathgauge/internal/guard"
 	"github.com/agoodley/pathgauge/internal/results"
 	"github.com/agoodley/pathgauge/internal/store"
 )
@@ -167,7 +168,7 @@ func (a *Alerts) apply(ctx context.Context, r store.AlertRule, ag store.Agent, v
 		e.ID = id
 		a.s.log.Warn("alert firing", "rule", r.Name, "agent", ag.Name, "value", v)
 		a.s.hub.broadcast(map[string]any{"type": "alert", "state": "firing", "event": e})
-		go a.deliver(r, e) //nolint:gosec // delivery outlives the evaluation context on purpose
+		guard.Go(a.s.log, "alert delivery", func() { a.deliver(r, e) }) // delivery outlives the evaluation context on purpose
 		return
 	}
 	if isOpen {
@@ -175,7 +176,7 @@ func (a *Alerts) apply(ctx context.Context, r store.AlertRule, ag store.Agent, v
 		open.State = "resolved"
 		open.Message = fmt.Sprintf("Resolved: %s on %s is %.2f", alertMetrics[r.Metric], ag.Name, v)
 		a.s.hub.broadcast(map[string]any{"type": "alert", "state": "resolved", "event": open})
-		go a.deliver(r, open) //nolint:gosec // delivery outlives the evaluation context on purpose
+		guard.Go(a.s.log, "alert delivery", func() { a.deliver(r, open) }) // delivery outlives the evaluation context on purpose
 	}
 }
 

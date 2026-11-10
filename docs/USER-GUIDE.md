@@ -167,6 +167,8 @@ The **health score** (0–100) adds up six components:
 | Path | 10 |
 | Integrity | 5 |
 
+A component whose tests weren't part of the run keeps its full points. A component whose tests were asked for and all failed scores 0, and the run gets a "tests did not complete" finding. A run in which nothing could be measured scores 0, so a `health_score` alert fires for a link that is down.
+
 Each finding states what was seen, why it matters and what to do. Key ideas:
 
 - **Bufferbloat grade:** how far latency rises under load (95th percentile). The grades are A+ (under 5 ms), A (under 30), B (under 60), C (under 200), D (under 400) and F. The cure is smart queue management (CAKE or fq_codel) at the bottleneck. The SQM tuner finds the right rate.
@@ -204,7 +206,9 @@ The `sqm` test measures capacity and bufferbloat. It then shapes this host's int
 
 Safety guarantees:
 
-- Shaping is a **lease**. It is removed when the test ends, when the lease expires (at most 1 hour), when the program stops, and at the next start if it ever crashed.
+- Shaping is a **lease**. It is removed when the test ends or is cancelled, when the lease expires (at most 1 hour), when the program stops, and at the next start if it ever crashed.
+- A lease is only forgotten once its shaping is confirmed gone. If `tc` can't remove it, the lease stays recorded (in `/run/pathgauge` for the agent service), removal is retried every 30 seconds, and the error is logged.
+- A remote client of `pathgauge endpoint --allow-shaping` can only shape the interface that routes back to it, and can never replace a qdisc you configured. The server's built-in endpoint accepts no shaping requests at all.
 - PathGauge **refuses to touch an interface that already has a custom qdisc**, so an existing SQM setup isn't destroyed unless you force it.
 - Shaping while it's active affects **all traffic on that interface**. This is the default scope; shaping only test traffic is planned.
 - Agents shape only if their local policy allows it (`shaping: interface`).

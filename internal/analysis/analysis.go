@@ -603,8 +603,14 @@ func Analyze(r *results.Report, exp Expectations) {
 			Recommendation: "Apply these settings on the router at this link's bottleneck: " + strings.Join(sqm.TCCommands, "; "), Evidence: []string{sqmID}})
 	}
 
+	// ---- tests that did not complete ----
+	comp := completenessOf(r, v.r)
+	if cf, ok := comp.finding(); ok {
+		add(cf)
+	}
+
 	// ---- score ----
-	score(&sum, f, bloat, lat, traces, pm, integ, udps)
+	score(&sum, f, comp, bloat, lat, traces, pm, integ, udps)
 	fingerprint(&sum, v, bloat, sweeps, pm, integ, traces)
 	if len(f) == 0 || countSev(f, "warning", "critical") == 0 {
 		f = append(f, results.Finding{ID: "overall.healthy", Severity: "good", Confidence: "medium",
@@ -795,8 +801,10 @@ func hostFindings(r *results.Report, info *results.Info, sum results.Summary, ad
 	}
 }
 
-// score computes the 0-100 health score from weighted components.
-func score(sum *results.Summary, f []results.Finding, bloat *results.Bufferbloat, lat *results.Latency, traces []*results.Trace, pm *results.PMTU, integ *results.Integrity, udps []*results.UDP) {
+// score computes the 0-100 health score from weighted components. A
+// component whose tests were not part of the run keeps full marks; one
+// whose tests were asked for and all failed scores 0.
+func score(sum *results.Summary, f []results.Finding, comp completeness, bloat *results.Bufferbloat, lat *results.Latency, traces []*results.Trace, pm *results.PMTU, integ *results.Integrity, udps []*results.UDP) {
 	parts := map[string]float64{}
 	// Throughput (25): full marks unless per-flow, retransmission or SLA findings.
 	tp := 25.0
@@ -853,6 +861,14 @@ func score(sum *results.Summary, f []results.Finding, bloat *results.Bufferbloat
 		in -= 2
 	}
 	parts["integrity"] = math.Max(0, in)
+	// Every part starts from full marks and loses them for what was
+	// measured. A part with nothing measured behind it, because its tests
+	// failed, has earned none.
+	for k := range parts {
+		if comp.unmeasured(k) {
+			parts[k] = 0
+		}
+	}
 	total := 0.0
 	for k, x := range parts {
 		parts[k] = stats.Round(x, 1)

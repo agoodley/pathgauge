@@ -460,6 +460,11 @@ func (s *Server) loadReport(ctx context.Context, id string) (*results.Report, st
 	return &rep, run, nil
 }
 
+// reportCSP is the policy for rendered reports: self-contained (no network
+// access at all) and sandboxed away from the dashboard's origin. The page's
+// own inline script, which only draws chart tooltips, still runs.
+const reportCSP = "sandbox allow-scripts; default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:; frame-ancestors 'none'"
+
 func (s *Server) renderReport(w http.ResponseWriter, r *http.Request, id, tmpl string, download bool) {
 	rep, _, err := s.loadReport(r.Context(), id)
 	if err != nil {
@@ -472,7 +477,11 @@ func (s *Server) renderReport(w http.ResponseWriter, r *http.Request, id, tmpl s
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:")
+	// Reports are built from data that agents and imported files supply, and
+	// share links serve them without a login. "sandbox" gives the page an
+	// origin of its own, so even a script that slipped through the report
+	// writer's escaping can't read or drive the dashboard on this origin.
+	w.Header().Set("Content-Security-Policy", reportCSP)
 	if download {
 		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="pathgauge-%s-%s.html"`, rep.StartedAt.Format("20060102-1504"), id[:6]))
 	}
@@ -534,7 +543,7 @@ func (s *Server) apiImport(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	err := s.store.FinishRun(r.Context(), id, b, store.RunSummary{HealthScore: rep.Summary.HealthScore, DownMbps: rep.Summary.DownMbps, UpMbps: rep.Summary.UpMbps,
+	_, err := s.store.FinishRun(r.Context(), id, agentID, b, store.RunSummary{HealthScore: rep.Summary.HealthScore, DownMbps: rep.Summary.DownMbps, UpMbps: rep.Summary.UpMbps,
 		RTTms: rep.Summary.IdleRTTms, BloatGrade: rep.Summary.BloatGrade, Findings: fj})
 	s.store.Audit(r.Context(), principal(r.Context()).Name, "run.import", id, "")
 	respond(w, map[string]string{"run_id": id}, err)
