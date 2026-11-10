@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptrace"
@@ -265,7 +266,12 @@ type Agent struct {
 	id     *Identity
 	tlsCfg *tls.Config
 
-	mu        sync.Mutex
+	mu sync.Mutex
+	// base lives as long as the agent (set by Run). Test runs hang off
+	// it, not off a control session: losing the connection to the server
+	// must not stop a test.
+	base      context.Context
+	runs      sync.WaitGroup      // test runs still winding down
 	out       chan agentproto.Msg // current connection's writer, nil when offline
 	runCancel context.CancelFunc
 	runID     string
@@ -320,7 +326,13 @@ func New(cfg config.Agent, policy config.Policy, log *slog.Logger) (*Agent, erro
 // Run connects to the server and serves until ctx ends.
 func (a *Agent) Run(ctx context.Context) error {
 	a.log.Info("agent starting", "name", a.id.Name, "id", a.id.AgentID, "server", a.id.ServerURL, "version", version.Get().Version)
+	a.mu.Lock()
+	a.base = ctx
+	a.mu.Unlock()
 	go guard.Loop(ctx, a.log, "monitoring", a.monitorLoop)
+	// On the way out, give a run that was interrupted a moment to undo
+	// what it set up (shaping) and to record that it was interrupted.
+	defer a.waitForRuns(10 * time.Second)
 	backoff := time.Second
 	for ctx.Err() == nil {
 		start := time.Now()
@@ -340,6 +352,17 @@ func (a *Agent) Run(ctx context.Context) error {
 		backoff = min(backoff*2, time.Minute)
 	}
 	return nil
+}
+
+// waitForRuns waits, up to limit, for test runs to finish winding down.
+func (a *Agent) waitForRuns(limit time.Duration) {
+	done := make(chan struct{})
+	go func() { a.runs.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(limit):
+		a.log.Warn("a test run had not finished stopping when the agent exited")
+	}
 }
 
 func (a *Agent) session(ctx context.Context) error {
@@ -362,7 +385,13 @@ func (a *Agent) session(ctx context.Context) error {
 	host := hostinfo.Collect(hostinfo.SystemSources())
 	hb, _ := json.Marshal(host)
 	pb, _ := json.Marshal(a.policy)
-	if err := wsjson.Write(ctx, ws, agentproto.Msg{Type: agentproto.TypeHello, Data: mustJSON(agentproto.Hello{Version: version.Get().Version, Host: hb, Policy: pb})}); err != nil {
+	// A test that was running when the last connection dropped is still
+	// running: tell the server, so it picks the run up again (or cancels
+	// it here if it has given up on it).
+	a.mu.Lock()
+	running := a.runID
+	a.mu.Unlock()
+	if err := wsjson.Write(ctx, ws, agentproto.Msg{Type: agentproto.TypeHello, Data: mustJSON(agentproto.Hello{Version: version.Get().Version, Host: hb, Policy: pb, RunID: running})}); err != nil {
 		return err
 	}
 	var welcome agentproto.Msg
@@ -395,7 +424,6 @@ func (a *Agent) session(ctx context.Context) error {
 	if len(pending) > 0 {
 		out <- agentproto.Msg{Type: agentproto.TypeMonitor, Data: mustJSON(agentproto.Monitor{Samples: pending})}
 	}
-	a.flushSpool(out)
 
 	errc := make(chan error, 1)
 	go func() {
@@ -412,9 +440,16 @@ func (a *Agent) session(ctx context.Context) error {
 					cancel()
 					return
 				}
+				if final(m) {
+					// Written to the server: the copy on disk has done its job.
+					a.unspool(m.RunID)
+				}
 			}
 		}
 	}()
+	// After the writer has started: more spooled outcomes than the queue
+	// holds must not block the session.
+	go a.flushSpool(ctx, out)
 	for {
 		var m agentproto.Msg
 		if err := wsjson.Read(ctx, ws, &m); err != nil {
@@ -434,34 +469,56 @@ func mustJSON(v any) json.RawMessage {
 	return b
 }
 
-// send queues a message for the server, spooling results while offline.
+// final reports whether m is the outcome of a run: its result or failure.
+func final(m agentproto.Msg) bool {
+	return m.RunID != "" && (m.Type == agentproto.TypeResult || m.Type == agentproto.TypeFailed)
+}
+
+// send queues a message for the server. The outcome of a run is written to
+// disk first and removed only once it has been written to the server, so a
+// connection that drops at the wrong moment does not lose it. Other
+// messages (live events) are dropped while offline.
 func (a *Agent) send(m agentproto.Msg) {
+	if final(m) {
+		a.spool(m)
+	}
 	a.mu.Lock()
 	out := a.out
 	a.mu.Unlock()
-	if out != nil {
-		select {
-		case out <- m:
-			return
-		case <-time.After(5 * time.Second):
-		}
+	if out == nil {
+		return
 	}
-	if m.Type == agentproto.TypeResult {
-		a.spool(m)
+	select {
+	case out <- m:
+	case <-time.After(5 * time.Second):
 	}
 }
 
 func (a *Agent) spoolDir() string { return filepath.Join(a.cfg.DataDir, "agent", "spool") }
 
+func (a *Agent) spoolFile(runID string) string {
+	return filepath.Join(a.spoolDir(), filepath.Base(runID)+".json")
+}
+
 func (a *Agent) spool(m agentproto.Msg) {
-	_ = os.MkdirAll(a.spoolDir(), 0o700)
-	b, _ := json.Marshal(m)
-	if err := os.WriteFile(filepath.Join(a.spoolDir(), m.RunID+".json"), b, 0o600); err == nil {
-		a.log.Info("server unreachable; result kept for later upload", "run", m.RunID)
+	b, err := json.Marshal(m)
+	if err == nil {
+		err = os.MkdirAll(a.spoolDir(), 0o700)
+	}
+	if err == nil {
+		err = os.WriteFile(a.spoolFile(m.RunID), b, 0o600)
+	}
+	if err != nil {
+		a.log.Warn("could not keep a copy of the run's outcome; it is lost if the connection drops before it is sent", "run", m.RunID, "err", err)
 	}
 }
 
-func (a *Agent) flushSpool(out chan agentproto.Msg) {
+func (a *Agent) unspool(runID string) { _ = os.Remove(a.spoolFile(runID)) }
+
+// flushSpool sends the outcomes of runs that finished while the agent was
+// offline, or whose upload was interrupted. Each file is removed by the
+// writer once its message has been written.
+func (a *Agent) flushSpool(ctx context.Context, out chan agentproto.Msg) {
 	entries, _ := os.ReadDir(a.spoolDir())
 	for _, e := range entries {
 		p := filepath.Join(a.spoolDir(), e.Name())
@@ -470,10 +527,15 @@ func (a *Agent) flushSpool(out chan agentproto.Msg) {
 			continue
 		}
 		var m agentproto.Msg
-		if json.Unmarshal(b, &m) == nil {
-			out <- m
-			_ = os.Remove(p)
-			a.log.Info("uploaded a spooled result", "run", m.RunID)
+		if json.Unmarshal(b, &m) != nil || !final(m) {
+			_ = os.Remove(p) // unreadable: it would be retried for ever
+			continue
+		}
+		select {
+		case out <- m:
+			a.log.Info("uploading the kept outcome of a run", "run", m.RunID, "type", m.Type)
+		case <-ctx.Done():
+			return
 		}
 	}
 }
@@ -486,7 +548,7 @@ func (a *Agent) handle(ctx context.Context, m agentproto.Msg) {
 			a.send(agentproto.Msg{Type: agentproto.TypeFailed, RunID: m.RunID, Error: "invalid run request"})
 			return
 		}
-		a.startRun(ctx, m.RunID, req)
+		a.startRun(m.RunID, req)
 	case agentproto.TypeCancel:
 		a.mu.Lock()
 		if a.runID == m.RunID && a.runCancel != nil {
@@ -564,18 +626,31 @@ func (a *Agent) buildOptions(req agentproto.RunRequest) (engine.Options, []strin
 	return o, notes, nil
 }
 
-func (a *Agent) startRun(ctx context.Context, runID string, req agentproto.RunRequest) {
+func (a *Agent) startRun(runID string, req agentproto.RunRequest) {
 	a.mu.Lock()
 	if a.runCancel != nil {
+		busyWith := a.runID
 		a.mu.Unlock()
-		a.send(agentproto.Msg{Type: agentproto.TypeFailed, RunID: runID, Error: "agent is busy"})
+		if busyWith == runID {
+			return // the same request again
+		}
+		a.send(agentproto.Msg{Type: agentproto.TypeFailed, RunID: runID, Error: "agent is busy with run " + busyWith})
 		return
 	}
-	rctx, cancel := context.WithCancel(ctx)
+	// The run belongs to the agent, not to the control session it was
+	// asked for on: it ends when it finishes, when the server cancels it,
+	// or when the agent stops.
+	base := a.base
+	if base == nil {
+		base = context.Background()
+	}
+	rctx, cancel := context.WithCancel(base)
 	a.runCancel, a.runID = cancel, runID
 	dataAddr := a.dataAddr
+	a.runs.Add(1)
 	a.mu.Unlock()
 	go func() {
+		defer a.runs.Done()
 		defer func() {
 			cancel()
 			a.mu.Lock()
@@ -609,20 +684,29 @@ func (a *Agent) startRun(ctx context.Context, runID string, req agentproto.RunRe
 		c, err := engine.Dial(dctx, dataAddr, a.id.AgentID, a.id.DataKey)
 		dcancel()
 		if err != nil {
-			a.send(agentproto.Msg{Type: agentproto.TypeFailed, RunID: runID, Error: "cannot reach the server's test endpoint at " + dataAddr + ": " + err.Error()})
+			if rctx.Err() == nil {
+				a.send(agentproto.Msg{Type: agentproto.TypeFailed, RunID: runID, Error: "cannot reach the server's test endpoint at " + dataAddr + ": " + err.Error()})
+			}
 			return
 		}
 		defer c.Close()
 		rep, err := engine.RunExclusive(rctx, c, opts)
+		if rctx.Err() != nil {
+			// Stopped before the end. What was measured so far is not a
+			// result, and is never uploaded as one.
+			if base.Err() != nil {
+				a.log.Info("run stopped because the agent is stopping", "run", runID)
+				a.send(agentproto.Msg{Type: agentproto.TypeFailed, RunID: runID, Error: "the agent was stopped during the run"})
+			} else {
+				a.log.Info("run cancelled", "run", runID)
+			}
+			return
+		}
 		if err != nil {
 			a.send(agentproto.Msg{Type: agentproto.TypeFailed, RunID: runID, Error: err.Error()})
 			return
 		}
 		rep.Notes = append(rep.Notes, notes...)
-		if rctx.Err() != nil && ctx.Err() == nil {
-			a.log.Info("run cancelled", "run", runID)
-			return
-		}
 		b, _ := json.Marshal(rep)
 		a.send(agentproto.Msg{Type: agentproto.TypeResult, RunID: runID, Data: b})
 		a.log.Info("run finished", "run", runID)
@@ -670,13 +754,23 @@ func (a *Agent) monitorLoop(ctx context.Context) {
 			c = nil
 			continue
 		}
-		s := store.Sample{TS: time.Now().Unix(), RTTMin: res.UDP.Min, RTTP50: res.UDP.Median, RTTP95: res.UDP.P95, RTTMax: res.UDP.Max,
-			Jitter: res.UDPJitterMs, LossPct: stats.Round(res.Loss.LossPct, 3), Sent: int(res.Loss.Sent)}
-		if res.UDP.N == 0 {
-			s = store.Sample{TS: s.TS, LossPct: 100, Sent: s.Sent}
-		}
-		a.queueSample(s, online)
+		a.queueSample(monitorSample(time.Now(), res), online)
 	}
+}
+
+// monitorSample turns one interval's latency result into a sample. With
+// no probe answered there is no latency to report: the fields stay nil
+// (a 0 would read as a perfect link and resolve latency alerts).
+func monitorSample(now time.Time, res *results.Latency) store.Sample {
+	s := store.Sample{TS: now.Unix(), LossPct: 100, Sent: int(res.Loss.Sent)}
+	if res.UDP.N == 0 {
+		return s
+	}
+	s.RTTMin, s.RTTP50, s.RTTP95, s.RTTMax = store.Ms(res.UDP.Min), store.Ms(res.UDP.Median), store.Ms(res.UDP.P95), store.Ms(res.UDP.Max)
+	s.Jitter = store.Ms(res.UDPJitterMs)
+	// Rounding must not turn "nearly everything lost" into "nothing answered".
+	s.LossPct = math.Min(stats.Round(res.Loss.LossPct, 3), 99.999)
+	return s
 }
 
 func (a *Agent) queueSample(s store.Sample, online bool) {

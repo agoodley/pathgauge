@@ -5,16 +5,33 @@ import (
 	"time"
 )
 
-// Sample is one monitoring interval for an agent.
+// Sample is one monitoring interval for an agent. The round-trip and
+// jitter figures are nil when no probe was answered in the interval (a
+// total outage): there is no latency to report then, and a 0 would read as
+// a perfect link.
 type Sample struct {
-	TS      int64   `json:"ts"` // unix seconds
-	RTTMin  float64 `json:"rtt_min"`
-	RTTP50  float64 `json:"rtt_p50"`
-	RTTP95  float64 `json:"rtt_p95"`
-	RTTMax  float64 `json:"rtt_max"`
-	Jitter  float64 `json:"jitter"`
-	LossPct float64 `json:"loss_pct"`
-	Sent    int     `json:"sent"`
+	TS      int64    `json:"ts"` // unix seconds
+	RTTMin  *float64 `json:"rtt_min"`
+	RTTP50  *float64 `json:"rtt_p50"`
+	RTTP95  *float64 `json:"rtt_p95"`
+	RTTMax  *float64 `json:"rtt_max"`
+	Jitter  *float64 `json:"jitter"`
+	LossPct float64  `json:"loss_pct"`
+	Sent    int      `json:"sent"`
+}
+
+// Ms returns v as a Sample latency value.
+func Ms(v float64) *float64 { return &v }
+
+// Answered reports whether any probe in the interval was answered.
+func (x Sample) Answered() bool { return x.LossPct < 100 }
+
+// normalise drops latency figures from a sample with no answers. Agents
+// up to 0.1.0-rc.6 sent zeros there.
+func (x *Sample) normalise() {
+	if !x.Answered() {
+		x.RTTMin, x.RTTP50, x.RTTP95, x.RTTMax, x.Jitter = nil, nil, nil, nil, nil
+	}
 }
 
 // AddSamples stores monitoring samples.
@@ -24,6 +41,7 @@ func (s *Store) AddSamples(ctx context.Context, agentID string, ss []Sample) err
 		return err
 	}
 	for _, x := range ss {
+		x.normalise()
 		if _, err := tx.ExecContext(ctx, `INSERT OR REPLACE INTO monitor_samples(agent_id,ts,rtt_min,rtt_p50,rtt_p95,rtt_max,jitter,loss_pct,sent) VALUES(?,?,?,?,?,?,?,?,?)`,
 			agentID, x.TS, x.RTTMin, x.RTTP50, x.RTTP95, x.RTTMax, x.Jitter, x.LossPct, x.Sent); err != nil {
 			_ = tx.Rollback()
@@ -34,7 +52,9 @@ func (s *Store) AddSamples(ctx context.Context, agentID string, ss []Sample) err
 }
 
 // Samples returns samples between from and to, aggregated into buckets of
-// step seconds (rollups are computed on query rather than stored).
+// step seconds (rollups are computed on query rather than stored). The
+// latency figures of a bucket come from its intervals that had answers and
+// are nil if none had.
 func (s *Store) Samples(ctx context.Context, agentID string, from, to time.Time, step int64) ([]Sample, error) {
 	if step < 1 {
 		step = 1
@@ -59,11 +79,11 @@ func (s *Store) Samples(ctx context.Context, agentID string, from, to time.Time,
 
 // HeatCell is the average of a metric for one hour of one weekday.
 type HeatCell struct {
-	Weekday int     `json:"weekday"` // 0 = Sunday
-	Hour    int     `json:"hour"`
-	RTTP95  float64 `json:"rtt_p95"`
-	LossPct float64 `json:"loss_pct"`
-	N       int     `json:"n"`
+	Weekday int      `json:"weekday"` // 0 = Sunday
+	Hour    int      `json:"hour"`
+	RTTP95  *float64 `json:"rtt_p95"` // nil if no probe was answered in that hour
+	LossPct float64  `json:"loss_pct"`
+	N       int      `json:"n"`
 }
 
 // Heatmap aggregates samples by weekday and hour (UTC) since from.

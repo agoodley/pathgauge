@@ -30,20 +30,20 @@ Errors look like `{"error": "message"}`, with a 4xx/5xx status.
 | `GET /api/profiles` | viewer | Profiles, test IDs and their titles; traffic-mix session kinds (`mix_kinds`: name, label, class, max), scenarios (`mix_scenarios`) and the default scenario (`mix_default`) |
 | `POST /api/runs` | operator | Start a run: `{agent_id, profile, tests?, skip?, scale?, max_rate_mbps?, streams?, trace_cycles?, mix?, no_dscp?}` → `{run_id}`. `mix` is a scenario name or `kind:count,...` for the `mix` test; `no_dscp` sends simulated calls unmarked; `cdp` configures the `cdp-up`/`cdp-down` tests: `{rate_mbps, burst_factor, burst_s, period_s, limit_mbps, streams, rpo_s, duration_s}` (zero means the default). An entry in `tests` that joins tests with `+` (`"voip+cdp-up+tcp-down"`) is a group run together; `group_duration_s` sets how long each grouped test runs and `no_baseline` skips running each on its own first. Reports then carry `groups` and `load_comparisons` (each grouped test's key results alone and together). Returns 400 for an invalid mix and 409 if the agent is busy. |
 | `GET /api/runs?agent=&status=&limit=` | viewer | Run list (newest first) |
-| `GET /api/runs/{id}` | viewer | Run with the full `report` ([results schema](../internal/results/results.go)) |
+| `GET /api/runs/{id}` | viewer | Run with the full `report` ([results schema](../internal/results/results.go)). `agent_away: true` on a running run means its agent has lost its connection; the test continues on the agent. |
 | `POST /api/runs/{id}/cancel`, `DELETE /api/runs/{id}` | operator | Cancel / delete |
 | `GET /api/runs/{id}/report.html?template=technical\|executive&download=1` | viewer | HTML report |
 | `POST /api/runs/{id}/share {hours, template}` | operator | Read-only share link (`/share/{token}`, no login) |
 | `GET /api/compare?runs=A,B[,C,D]` | viewer | Side-by-side summaries and findings |
 | `POST /api/import?agent=` | operator | Import a results JSON file from `pathgauge test` |
-| `GET /api/monitor/{agent}?hours=24[&step=s]` | viewer | Monitoring samples, aggregated per step |
-| `GET /api/monitor/{agent}/heatmap?days=28` | viewer | Hour × weekday averages (UTC) |
+| `GET /api/monitor/{agent}?hours=24[&step=s]` | viewer | Monitoring samples, aggregated per step. `rtt_min`, `rtt_p50`, `rtt_p95`, `rtt_max` and `jitter` are `null` for a step in which no probe was answered (an outage); `loss_pct` is 100 there. |
+| `GET /api/monitor/{agent}/heatmap?days=28` | viewer | Hour × weekday averages (UTC). `rtt_p95` is `null` for an hour with no answered probe. |
 | `GET /api/annotations/{agent}`, `POST /api/annotations`, `DELETE /api/annotations/{id}` | viewer/operator | Time-range notes on charts |
 | `GET/POST /api/schedules`, `PUT/DELETE /api/schedules/{id}` | viewer/operator | `{agent_id, profile, tests, cron, enabled, note}` |
 | `GET/POST /api/alert-rules`, `PUT/DELETE /api/alert-rules/{id}`, `POST /api/alert-rules/{id}/test` | viewer/operator | `{name, agent_id, metric, op, threshold, for_minutes, channel, target, enabled}` |
 | `GET /api/alerts` | viewer | Alert events (firing and resolved) |
 | `GET /api/live` | viewer | WebSocket: `run_event`, `run_status`, `agent_status`, `monitor`, `alert` |
-| `GET /metrics` | viewer | Prometheus text format |
+| `GET /metrics` | viewer | Prometheus text format. The monitoring latency and jitter gauges are left out for an agent whose latest sample had no answered probe. |
 | `GET/POST /api/users`, `PUT/DELETE /api/users/{id}` | admin | Users |
 | `GET/POST /api/tokens`, `DELETE /api/tokens/{id}` | admin | API tokens (`POST {name, role}` returns the token once) |
 | `GET/PUT /api/settings` | admin | `server_name, org_name, smtp_host, smtp_port, smtp_user, smtp_password, smtp_from` |

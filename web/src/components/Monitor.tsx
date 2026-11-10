@@ -20,15 +20,23 @@ export type RangeId = (typeof RANGES)[number]['id'];
 
 const timeFmt = new Intl.DateTimeFormat(undefined, { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
 
-function withGaps(samples: Sample[], step: number, pick: (s: Sample) => number): [number, number | null][] {
+// Chart points, with a break in the line where samples are missing or have
+// no value (latency during an outage).
+function withGaps(samples: Sample[], step: number, pick: (s: Sample) => number | null): [number, number | null][] {
   const out: [number, number | null][] = [];
   let prev: number | null = null;
   for (const s of samples) {
     if (prev !== null && s.ts - prev > step * 2.5) out.push([(prev + step) * 1000, null]);
-    out.push([s.ts * 1000, isNum(pick(s)) ? Math.round(pick(s) * 1000) / 1000 : null]);
+    const v = pick(s);
+    out.push([s.ts * 1000, isNum(v) ? Math.round(v * 1000) / 1000 : null]);
     prev = s.ts;
   }
   return out;
+}
+
+/** Values of one field, leaving out samples that have none. */
+function present(samples: Sample[], pick: (s: Sample) => number | null): number[] {
+  return samples.map(pick).filter((v): v is number => isNum(v));
 }
 
 export function MonitorCharts({
@@ -99,20 +107,35 @@ export function MonitorCharts({
     return <Empty>No monitoring samples in this period. Enable monitoring in the agent's settings to collect them.</Empty>;
 
   const lastS = ss[ss.length - 1];
-  const avg = (f: (s: Sample) => number) => ss.reduce((a, s) => a + f(s), 0) / ss.length;
+  // Averages and the worst value come from the samples that have one;
+  // null (shown as a dash) if none has.
+  const avg = (f: (s: Sample) => number | null) => {
+    const vs = present(ss, f);
+    return vs.length ? vs.reduce((a, v) => a + v, 0) / vs.length : null;
+  };
+  const worstP95 = present(ss, (s) => s.rtt_p95);
+  const down = !isNum(lastS.rtt_p50) && lastS.loss_pct >= 100;
   const stepLabel = charts.step >= 3600 ? `${charts.step / 3600} h` : `${charts.step / 60} min`;
   return (
     <div>
       {showTiles && (
         <div className="tiles">
           <Tile label="RTT p50 (latest)" value={fmtMs(lastS.rtt_p50)} sub={`period average ${fmtMs(avg((s) => s.rtt_p50))}`} />
-          <Tile label="RTT p95 (latest)" value={fmtMs(lastS.rtt_p95)} sub={`period worst ${fmtMs(Math.max(...ss.map((s) => s.rtt_p95)))}`} />
+          <Tile
+            label="RTT p95 (latest)"
+            value={fmtMs(lastS.rtt_p95)}
+            sub={`period worst ${fmtMs(worstP95.length ? Math.max(...worstP95) : null)}`}
+          />
           <Tile label="Jitter (latest)" value={fmtMs(lastS.jitter)} sub={`period average ${fmtMs(avg((s) => s.jitter))}`} />
           <Tile label="Loss (latest)" value={fmtPct(lastS.loss_pct)} sub={`period average ${fmtPct(avg((s) => s.loss_pct))}`} />
         </div>
       )}
+      {down && (
+        <p className="muted small">No probe was answered in the latest interval, so there is no latency to show for it.</p>
+      )}
       <p className="muted small">
-        {ss.length} points, {stepLabel} buckets (RTT p50 averaged, p95 worst per bucket). Shaded areas are annotations.
+        {ss.length} points, {stepLabel} buckets (RTT p50 averaged, p95 worst per bucket). Shaded areas are annotations. The
+        latency lines break where no probe was answered.
       </p>
       <div className="chart-stack">
         <Figure title="Round-trip time" option={charts.rtt} height={240} />
@@ -153,12 +176,19 @@ export function Heatmap({ agentId, days = 28 }: { agentId: string; days?: number
     const cells = hm.data ?? [];
     const hours = Array.from({ length: 24 }, (_, h) => String(h).padStart(2, '0'));
     const rows = ROW_ORDER.map((d) => DAYS[d]);
-    const data: [number, number, number, string][] = cells.map((c) => [
-      c.hour,
-      ROW_ORDER.indexOf(c.weekday),
-      Math.round(c.rtt_p95 * 100) / 100,
-      `RTT p95 ${fmtMs(c.rtt_p95)} · loss ${fmtPct(c.loss_pct)} · ${c.n} samples`,
-    ]);
+    // Hours in which no probe was answered have no latency and stay blank.
+    const data: [number, number, number, string][] = cells.flatMap((c) =>
+      isNum(c.rtt_p95)
+        ? [
+            [
+              c.hour,
+              ROW_ORDER.indexOf(c.weekday),
+              Math.round(c.rtt_p95 * 100) / 100,
+              `RTT p95 ${fmtMs(c.rtt_p95)} · loss ${fmtPct(c.loss_pct)} · ${c.n} samples`,
+            ] as [number, number, number, string],
+          ]
+        : [],
+    );
     return { opt: heatmapOption(P, { xCats: hours, yCats: rows, data, xName: 'hour of day (UTC)', yName: '', unit: 'ms' }), cells };
   }, [hm.data, P]);
   if (hm.error) return <ErrorBox error={hm.error} onRetry={hm.reload} />;

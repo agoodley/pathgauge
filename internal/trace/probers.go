@@ -100,7 +100,8 @@ func (s *simple) probe(ctx context.Context, ttl, port int) reply {
 			r.rtt = time.Since(sent)
 		}
 		r.ok = true
-		r.dest = se.IsUnreachable() || r.from == s.target
+		r.dest = se.IsPortUnreachable() || r.from == s.target
+		r.blocked = se.IsUnreachable() && !r.dest
 		return r
 	}
 	return r
@@ -114,15 +115,17 @@ type paris struct {
 	icmp   *icmp.PacketConn
 	udp    *net.UDPConn
 	lport  int
+	dst    netip.AddrPort
 
 	mu      sync.Mutex
 	pending map[int]*pendingProbe // by UDP length
 }
 
 type pendingProbe struct {
-	ttl  int
-	sent time.Time
-	done chan reply
+	ttl     int
+	sent    time.Time
+	done    chan reply
+	sendErr string // why the probe could not be sent, if it could not
 }
 
 func newParis(target netip.Addr, o Options) (*paris, error) {
@@ -133,13 +136,22 @@ func newParis(target netip.Addr, o Options) (*paris, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrNeedRaw, err)
 	}
-	u, err := net.DialUDP("udp4", nil, net.UDPAddrFromAddrPort(netip.AddrPortFrom(target, uint16(o.Port))))
+	// The socket is not connected on purpose. On a connected UDP socket the
+	// kernel turns the destination's port-unreachable into a pending socket
+	// error, and the next probe's send fails with ECONNREFUSED instead of
+	// going out: a probe never sent, counted as lost. An unconnected socket
+	// keeps one source port (so one flow) without that; the raw socket sees
+	// the ICMP replies.
+	u, err := net.ListenUDP("udp4", nil)
 	if err != nil {
 		_ = ic.Close()
 		return nil, err
 	}
-	p := &paris{target: target, o: o, icmp: ic, udp: u, lport: u.LocalAddr().(*net.UDPAddr).Port, pending: map[int]*pendingProbe{}}
-	// Discard ICMP errors on the UDP socket itself; the raw socket sees them.
+	p := &paris{
+		target: target, o: o, icmp: ic, udp: u, lport: u.LocalAddr().(*net.UDPAddr).Port,
+		dst:     netip.AddrPortFrom(target, uint16(o.Port)),
+		pending: map[int]*pendingProbe{},
+	}
 	go p.readICMP()
 	return p, nil
 }
@@ -165,13 +177,13 @@ func (p *paris) readICMP() {
 		}
 		var data []byte
 		var exts []icmp.Extension
-		dest := false
+		unreach := false
 		switch b := msg.Body.(type) {
 		case *icmp.TimeExceeded:
 			data, exts = b.Data, b.Extensions
 		case *icmp.DstUnreach:
 			data, exts = b.Data, b.Extensions
-			dest = true
+			unreach = true
 		default:
 			continue
 		}
@@ -189,7 +201,12 @@ func (p *paris) readICMP() {
 			continue
 		}
 		from, _ := netip.ParseAddr(peer.(*net.IPAddr).IP.String())
-		r := reply{ttl: pp.ttl, from: from.Unmap(), rtt: now.Sub(pp.sent), ok: true, dest: dest || from == p.target}
+		r := reply{ttl: pp.ttl, from: from.Unmap(), rtt: now.Sub(pp.sent), ok: true}
+		// Only the target, or a port-unreachable (the probe reached a host
+		// with nothing listening), is the end of the path. Any other
+		// unreachable is a device on the way refusing the probe.
+		r.dest = r.from == p.target || (unreach && msg.Code == icmpPortUnreachable)
+		r.blocked = unreach && !r.dest
 		for _, e := range exts {
 			if m, ok := e.(*icmp.MPLSLabelStack); ok {
 				for _, l := range m.Labels {
@@ -234,38 +251,49 @@ func (p *paris) cycle(ctx context.Context, maxTTL int) []reply {
 			p.mu.Unlock()
 			_ = pc.SetTTL(ttl)
 			pp.sent = time.Now()
-			_, _ = p.udp.Write(payload[:plen])
+			if _, err := p.udp.WriteToUDPAddrPort(payload[:plen], p.dst); err != nil {
+				pp.sendErr = err.Error()
+			}
 			probes = append(probes, pp)
 			time.Sleep(2 * time.Millisecond) // gentle on ICMP rate limiters
 		}
 	}
-	deadline := time.After(p.o.Timeout)
-	out := make([]reply, 0, len(probes))
-	for _, pp := range probes {
-		select {
-		case r := <-pp.done:
-			out = append(out, r)
-		case <-deadline:
-			out = append(out, reply{ttl: pp.ttl})
-			deadline = closedChan()
-		case <-ctx.Done():
-			out = append(out, reply{ttl: pp.ttl})
-		}
-	}
+	out := collect(ctx, probes, p.o.Timeout)
 	p.mu.Lock()
 	clear(p.pending)
 	p.mu.Unlock()
-	// Drain socket errors so the queue does not grow.
-	for {
-		if _, err := netx.ReadErrQueue(p.udp); err != nil {
-			break
+	return out
+}
+
+// collect waits up to timeout for the probes' answers. Once the time is up
+// (or ctx ends) it still takes every answer that has already arrived: only
+// a probe with no answer by then is lost.
+func collect(ctx context.Context, probes []*pendingProbe, timeout time.Duration) []reply {
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	waiting := true
+	out := make([]reply, 0, len(probes))
+	for _, pp := range probes {
+		if waiting {
+			select {
+			case r := <-pp.done:
+				out = append(out, r)
+				continue
+			case <-deadline.C:
+			case <-ctx.Done():
+			}
+			waiting = false
+		}
+		select {
+		case r := <-pp.done:
+			out = append(out, r)
+		default:
+			out = append(out, reply{ttl: pp.ttl, errMsg: pp.sendErr})
 		}
 	}
 	return out
 }
 
-func closedChan() <-chan time.Time {
-	c := make(chan time.Time)
-	close(c)
-	return c
-}
+// icmpPortUnreachable is the ICMPv4 destination-unreachable code a host
+// sends when nothing listens on the probed port.
+const icmpPortUnreachable = 3

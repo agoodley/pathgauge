@@ -138,10 +138,11 @@ export function RunsTable({
   );
 }
 
-export function Sparkline({ values, height = 44 }: { values: number[]; height?: number }) {
+export function Sparkline({ values, height = 44 }: { values: (number | null)[]; height?: number }) {
   const P = usePalette();
   const opt = useMemo(() => sparkOption(P, values, (v) => fmtMs(v)), [P, values]);
-  if (values.length < 2) return <div className="spark-empty muted">No monitoring data in the last 24 h</div>;
+  // null is a period with no answered probe: a break in the line.
+  if (values.filter((v) => v !== null).length < 2) return <div className="spark-empty muted">No monitoring data in the last 24 h</div>;
   return <EChart option={opt} height={height} label="RTT p95 over the last 24 hours" />;
 }
 

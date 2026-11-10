@@ -364,6 +364,9 @@ type Run struct {
 	BloatGrade  string          `json:"bloat_grade"`
 	Findings    json.RawMessage `json:"findings,omitempty"`
 	Report      json.RawMessage `json:"report,omitempty"`
+	// AgentAway is set by the server (not stored): the run is active but
+	// its agent has lost its connection. The test continues on the agent.
+	AgentAway bool `json:"agent_away,omitempty"`
 }
 
 const runCols = `r.id,r.agent_id,COALESCE(a.name,''),r.profile,r.options_json,r.status,r.trigger,COALESCE(r.requested_by,''),r.created_at,

@@ -68,6 +68,8 @@ var migrations = []string{
 	CREATE TABLE audit(id INTEGER PRIMARY KEY, ts TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, target TEXT NOT NULL DEFAULT '', detail TEXT NOT NULL DEFAULT '');
 	CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 	CREATE TABLE annotations(id INTEGER PRIMARY KEY, agent_id TEXT NOT NULL, ts_start INTEGER NOT NULL, ts_end INTEGER NOT NULL, text TEXT NOT NULL, author TEXT);`,
+	// 2: an interval with no answered probe used to store its latency as 0.
+	`UPDATE monitor_samples SET rtt_min=NULL, rtt_p50=NULL, rtt_p95=NULL, rtt_max=NULL, jitter=NULL WHERE loss_pct >= 100;`,
 }
 
 func (s *Store) migrate(ctx context.Context) error {

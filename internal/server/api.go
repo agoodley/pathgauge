@@ -408,6 +408,9 @@ func (s *Server) apiRuns(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) apiRun(w http.ResponseWriter, r *http.Request) {
 	run, err := s.store.GetRun(r.Context(), r.PathValue("rid"), true)
+	if err == nil && run.Status == "running" {
+		run.AgentAway = s.hub.AgentAway(run.ID)
+	}
 	respond(w, run, err)
 }
 
@@ -600,7 +603,7 @@ func (s *Server) apiOverview(w http.ResponseWriter, r *http.Request) {
 		Agent    store.Agent   `json:"agent"`
 		LastRun  *store.Run    `json:"last_run,omitempty"`
 		Latest   *store.Sample `json:"latest_sample,omitempty"`
-		Spark    []float64     `json:"spark_rtt_p95"`
+		Spark    []*float64    `json:"spark_rtt_p95"` // null: no probe answered in that half hour
 		Alerting int           `json:"alerts_firing"`
 	}
 	events, _ := s.store.AlertEvents(ctx, 200)
@@ -611,7 +614,7 @@ func (s *Server) apiOverview(w http.ResponseWriter, r *http.Request) {
 		}
 		s.decorate(&a)
 		a.Host = nil
-		l := link{Agent: a, Spark: []float64{}}
+		l := link{Agent: a, Spark: []*float64{}}
 		if runs, _ := s.store.Runs(ctx, a.ID, "done", 1); len(runs) > 0 {
 			l.LastRun = &runs[0]
 		}

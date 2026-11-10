@@ -475,7 +475,7 @@ export function heatmapOption(P: Palette, o: HeatOpts): Option {
 }
 
 /** A small axis-free trend line with a hover tooltip. */
-export function sparkOption(P: Palette, values: number[], fmt: (v: number) => string): Option {
+export function sparkOption(P: Palette, values: (number | null)[], fmt: (v: number) => string): Option {
   return {
     animation: false,
     grid: { left: 2, right: 2, top: 4, bottom: 2 },

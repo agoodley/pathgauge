@@ -603,6 +603,16 @@ func runMixPhase(ctx context.Context, c *Client, entries []MixEntry, dur time.Du
 	if ctx.Err() != nil {
 		return ph, ctx.Err()
 	}
+	// The other sessions' results are "with transfers" only if the
+	// transfers ran; without them they were measured on a quieter link.
+	for _, e := range entries {
+		if e.Kind.Class != "bulk" {
+			continue
+		}
+		if err := loadErr("the "+strings.ToLower(e.Kind.Label), bulk[e.Kind.Dir], bulkErr[e.Kind.Dir]); err != nil {
+			return ph, fmt.Errorf("%w, so the other sessions were not measured alongside it", err)
+		}
+	}
 
 	// Collect the endpoint's side of every real-time session.
 	sleepCtx(ctx, 300*time.Millisecond)
