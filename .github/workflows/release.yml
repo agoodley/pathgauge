@@ -18,7 +18,7 @@ jobs:
         with:
           go-version-file: go.mod
       # GoReleaser's before hook builds the dashboard (web/) with npm.
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: npm
